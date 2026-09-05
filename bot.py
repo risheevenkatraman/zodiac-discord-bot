@@ -195,16 +195,29 @@ def parse_role_permissions(value: str) -> discord.Permissions:
     return discord.Permissions(**{permission: True for permission in normalized})
 
 
-class AccessSetupModal(discord.ui.Modal, title="Create role and channel"):
+def parse_role_color(value: str) -> discord.Colour:
+    normalized = value.strip().lstrip("#")
+    if len(normalized) != 6:
+        raise ValueError("Role color must be a 6-digit hexadecimal value, such as #5865F2.")
+    try:
+        return discord.Colour(int(normalized, 16))
+    except ValueError as error:
+        raise ValueError(
+            "Role color must be a 6-digit hexadecimal value, such as #5865F2."
+        ) from error
+
+
+class AccessSetupModal(discord.ui.Modal, title="Create role"):
     role_name = discord.ui.TextInput(
-        label="New role name",
+        label="Role name",
         placeholder="e.g. Event Staff",
         max_length=100,
     )
-    channel_name = discord.ui.TextInput(
-        label="Private channel name",
-        placeholder="e.g. event-planning",
-        max_length=100,
+    role_color = discord.ui.TextInput(
+        label="Role color (hex)",
+        placeholder="#5865F2",
+        default="#5865F2",
+        max_length=7,
     )
     permissions = discord.ui.TextInput(
         label="Role permissions (comma-separated)",
@@ -225,42 +238,42 @@ class AccessSetupModal(discord.ui.Modal, title="Create role and channel"):
             return
         try:
             permissions = parse_role_permissions(str(self.permissions))
+            color = parse_role_color(str(self.role_color))
         except ValueError as error:
             await interaction.response.send_message(str(error), ephemeral=True)
             return
 
-        view = AccessSetupView(
+        view = RoleSetupView(
             owner_id=self.owner_id,
             bot=self.bot,
             role_name=str(self.role_name).strip(),
-            channel_name=str(self.channel_name).strip().lower().replace(" ", "-"),
             permissions=permissions,
+            color=color,
         )
         await interaction.response.send_message(
-            "Select the existing roles that should access the new private channel, "
-            "then click **Create**. The new role will also have access.",
+            "Review the role details, then click **Create**. This command creates "
+            "only the role; use `/create_channel` separately for channels.",
             view=view,
             ephemeral=True,
         )
         view.message = await interaction.original_response()
 
 
-class AccessSetupView(discord.ui.View):
+class RoleSetupView(discord.ui.View):
     def __init__(
         self,
         owner_id: int,
         bot: ZodiacBot,
         role_name: str,
-        channel_name: str,
         permissions: discord.Permissions,
+        color: discord.Colour,
     ) -> None:
         super().__init__(timeout=300)
         self.owner_id = owner_id
         self.bot = bot
         self.role_name = role_name
-        self.channel_name = channel_name
         self.permissions = permissions
-        self.selected_role_ids: list[int] = []
+        self.color = color
         self.message: discord.WebhookMessage | None = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -270,20 +283,6 @@ class AccessSetupView(discord.ui.View):
             "Only the person who opened this setup can use it.", ephemeral=True
         )
         return False
-
-    @discord.ui.select(
-        cls=discord.ui.RoleSelect,
-        placeholder="Choose roles that can access the channel",
-        min_values=1,
-        max_values=25,
-    )
-    async def roles(
-        self, interaction: discord.Interaction, select: discord.ui.RoleSelect
-    ) -> None:
-        self.selected_role_ids = [role.id for role in select.values]
-        await interaction.response.send_message(
-            f"Selected {len(self.selected_role_ids)} access role(s).", ephemeral=True
-        )
 
     @discord.ui.button(label="Create", style=discord.ButtonStyle.success)
     async def create(
@@ -299,81 +298,38 @@ class AccessSetupView(discord.ui.View):
         if (
             member is None
             or not member.guild_permissions.manage_roles
-            or not member.guild_permissions.manage_channels
         ):
             await interaction.response.send_message(
-                "I need both **Manage Roles** and **Manage Channels** permissions.",
+                "I need the **Manage Roles** permission.",
                 ephemeral=True,
             )
             return
-        if not self.selected_role_ids:
+        if not self.role_name:
             await interaction.response.send_message(
-                "Select at least one existing access role first.", ephemeral=True
-            )
-            return
-        if not self.role_name or not self.channel_name:
-            await interaction.response.send_message(
-                "Role and channel names cannot be empty.", ephemeral=True
-            )
-            return
-
-        selected_roles = [
-            role
-            for role_id in self.selected_role_ids
-            if (role := guild.get_role(role_id)) is not None
-            and role != guild.default_role
-        ]
-        if not selected_roles:
-            await interaction.response.send_message(
-                "The selected roles are no longer available.", ephemeral=True
+                "The role name cannot be empty.", ephemeral=True
             )
             return
 
         await interaction.response.defer(ephemeral=True)
-        new_role: discord.Role | None = None
         try:
-            new_role = await guild.create_role(
+            role = await guild.create_role(
                 name=self.role_name,
                 permissions=self.permissions,
-                reason=f"Access setup by {interaction.user}",
-            )
-            overwrites: dict[discord.Role, discord.PermissionOverwrite] = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                new_role: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                ),
-            }
-            for role in selected_roles:
-                overwrites[role] = discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                )
-            channel = await guild.create_text_channel(
-                self.channel_name,
-                overwrites=overwrites,
+                colour=self.color,
                 reason=f"Access setup by {interaction.user}",
             )
         except discord.HTTPException:
-            if new_role is not None:
-                try:
-                    await new_role.delete(reason="Cleaning up failed access setup")
-                except discord.HTTPException:
-                    LOGGER.exception("Failed to clean up role %s", new_role.id)
-            LOGGER.exception("Failed to create access role/channel in guild %s", guild.id)
+            LOGGER.exception("Failed to create role in guild %s", guild.id)
             await interaction.followup.send(
-                "Discord rejected the setup. Check my role position and permissions, "
-                "then try again.",
+                "Discord rejected the role creation. Check my role position and "
+                "permissions, then try again.",
                 ephemeral=True,
             )
             return
 
         self.disable_all_items()
         await interaction.followup.send(
-            f"Created {new_role.mention} with the requested permissions and "
-            f"{channel.mention}. Access was granted to the selected roles.",
+            f"Created {role.mention} with the requested permissions and color.",
             ephemeral=True,
         )
         if self.message:
@@ -398,10 +354,16 @@ class ChannelSetupModal(discord.ui.Modal, title="Create private channel"):
         self.bot = bot
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This setup can only be used in a server.", ephemeral=True
+            )
+            return
         view = ChannelSetupView(
             owner_id=self.owner_id,
             bot=self.bot,
             channel_name=str(self.channel_name).strip().lower().replace(" ", "-"),
+            roles=interaction.guild.roles,
         )
         await interaction.response.send_message(
             "Select a category and the roles that should access the channel, "
@@ -412,8 +374,58 @@ class ChannelSetupModal(discord.ui.Modal, title="Create private channel"):
         view.message = await interaction.original_response()
 
 
+class AllRolesSelect(discord.ui.Select):
+    def __init__(self, view: ChannelSetupView) -> None:
+        self.setup_view = view
+        super().__init__(
+            placeholder="Choose roles with access",
+            min_values=1,
+            max_values=max(1, min(25, len(view.role_pages[view.role_page]))),
+            options=self.build_options(),
+            row=1,
+        )
+
+    def build_options(self) -> list[discord.SelectOption]:
+        page_roles = self.setup_view.role_pages[self.setup_view.role_page]
+        return [
+            discord.SelectOption(
+                label=role.name[:100],
+                value=str(role.id),
+                default=role.id in self.setup_view.selected_role_ids,
+            )
+            for role in page_roles
+        ]
+
+    def refresh_options(self) -> None:
+        self.options = self.build_options()
+        self.max_values = max(1, min(25, len(self.setup_view.role_pages[self.setup_view.role_page])))
+        self.placeholder = (
+            f"Choose roles (page {self.setup_view.role_page + 1}/"
+            f"{len(self.setup_view.role_pages)})"
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        page_role_ids = {
+            role.id for role in self.setup_view.role_pages[self.setup_view.role_page]
+        }
+        self.setup_view.selected_role_ids = [
+            role_id
+            for role_id in self.setup_view.selected_role_ids
+            if role_id not in page_role_ids
+        ]
+        self.setup_view.selected_role_ids.extend(int(value) for value in self.values)
+        self.setup_view.refresh_role_controls()
+        await interaction.response.edit_message(view=self.setup_view)
+
+
 class ChannelSetupView(discord.ui.View):
-    def __init__(self, owner_id: int, bot: ZodiacBot, channel_name: str) -> None:
+    def __init__(
+        self,
+        owner_id: int,
+        bot: ZodiacBot,
+        channel_name: str,
+        roles: list[discord.Role],
+    ) -> None:
         super().__init__(timeout=300)
         self.owner_id = owner_id
         self.bot = bot
@@ -421,6 +433,22 @@ class ChannelSetupView(discord.ui.View):
         self.category_id: int | None = None
         self.selected_role_ids: list[int] = []
         self.message: discord.WebhookMessage | None = None
+        self.role_pages = [
+            roles[index : index + 25]
+            for index in range(0, len(roles), 25)
+            if roles[index : index + 25]
+        ]
+        if not self.role_pages:
+            self.role_pages = [[]]
+        self.role_page = 0
+        self.role_select = AllRolesSelect(self)
+        self.add_item(self.role_select)
+        self.refresh_role_controls()
+
+    def refresh_role_controls(self) -> None:
+        self.role_select.refresh_options()
+        self.previous_page.disabled = self.role_page == 0
+        self.next_page.disabled = self.role_page == len(self.role_pages) - 1
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
@@ -445,21 +473,27 @@ class ChannelSetupView(discord.ui.View):
             "Category selected.", ephemeral=True
         )
 
-    @discord.ui.select(
-        cls=discord.ui.RoleSelect,
-        placeholder="Choose roles with access",
-        min_values=1,
-        max_values=25,
+    @discord.ui.button(
+        label="Previous roles", style=discord.ButtonStyle.secondary, row=2
     )
-    async def roles(
-        self, interaction: discord.Interaction, select: discord.ui.RoleSelect
+    async def previous_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        self.selected_role_ids = [role.id for role in select.values]
-        await interaction.response.send_message(
-            f"Selected {len(self.selected_role_ids)} access role(s).", ephemeral=True
-        )
+        self.role_page -= 1
+        self.refresh_role_controls()
+        await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="Create", style=discord.ButtonStyle.success)
+    @discord.ui.button(
+        label="Next roles", style=discord.ButtonStyle.secondary, row=2
+    )
+    async def next_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.role_page += 1
+        self.refresh_role_controls()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Create", style=discord.ButtonStyle.success, row=2)
     async def create(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -599,6 +633,83 @@ def register_commands(bot: ZodiacBot) -> None:
     async def create_channel(interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(
             ChannelSetupModal(interaction.user.id, bot)
+        )
+
+    @bot.tree.command(name="delete_role", description="Delete a server role.")
+    @app_commands.describe(role="Role to delete")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def delete_role(
+        interaction: discord.Interaction, role: discord.Role
+    ) -> None:
+        guild = interaction.guild
+        member = guild.me if guild else None
+        if guild is None or member is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if role == guild.default_role:
+            await interaction.response.send_message(
+                "The @everyone role cannot be deleted.", ephemeral=True
+            )
+            return
+        if not member.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "I need the **Manage Roles** permission.", ephemeral=True
+            )
+            return
+        if role >= member.top_role:
+            await interaction.response.send_message(
+                "I can only delete roles below my highest role.", ephemeral=True
+            )
+            return
+
+        try:
+            await role.delete(reason=f"Deleted by {interaction.user}")
+        except discord.HTTPException:
+            LOGGER.exception("Failed to delete role %s in guild %s", role.id, guild.id)
+            await interaction.response.send_message(
+                "Discord rejected the role deletion. Check my permissions and "
+                "role hierarchy.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(f"Deleted the `{role.name}` role.")
+
+    @bot.tree.command(name="delete_channel", description="Delete a server channel.")
+    @app_commands.describe(channel="Channel to delete")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    async def delete_channel(
+        interaction: discord.Interaction, channel: discord.TextChannel
+    ) -> None:
+        guild = interaction.guild
+        member = guild.me if guild else None
+        if guild is None or member is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if not member.guild_permissions.manage_channels:
+            await interaction.response.send_message(
+                "I need the **Manage Channels** permission.", ephemeral=True
+            )
+            return
+
+        try:
+            await channel.delete(reason=f"Deleted by {interaction.user}")
+        except discord.HTTPException:
+            LOGGER.exception(
+                "Failed to delete channel %s in guild %s", channel.id, guild.id
+            )
+            await interaction.response.send_message(
+                "Discord rejected the channel deletion. Check my permissions.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"Deleted the `#{channel.name}` channel.", ephemeral=True
         )
 
     @bot.tree.command(
