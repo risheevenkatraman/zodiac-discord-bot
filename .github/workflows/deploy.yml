@@ -1,0 +1,57 @@
+name: Deploy bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AWS_SSH_KEY }}
+
+      - name: Trust deployment host
+        env:
+          AWS_KNOWN_HOSTS: ${{ secrets.AWS_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AWS_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+
+      - name: Upload source
+        env:
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_USER: ${{ secrets.AWS_USER }}
+        run: |
+          tar \
+            --exclude=.git \
+            --exclude=.github \
+            --exclude=.venv \
+            --exclude=.env \
+            --exclude=zodiac.db \
+            -czf - . | ssh "$AWS_USER@$AWS_HOST" \
+            "sudo mkdir -p /opt/zodiac-discord-bot && sudo tar -xzf - -C /opt/zodiac-discord-bot"
+
+      - name: Install and restart service
+        env:
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_USER: ${{ secrets.AWS_USER }}
+        run: |
+          ssh "$AWS_USER@$AWS_HOST" \
+            "sudo python3 -m venv /opt/zodiac-discord-bot/.venv && \
+             sudo /opt/zodiac-discord-bot/.venv/bin/pip install --upgrade pip && \
+             sudo /opt/zodiac-discord-bot/.venv/bin/pip install -r /opt/zodiac-discord-bot/requirements.txt && \
+             sudo install -m 0644 /opt/zodiac-discord-bot/deploy/zodiac-bot.service /etc/systemd/system/zodiac-bot.service && \
+             sudo chown -R ubuntu:ubuntu /opt/zodiac-discord-bot && \
+             sudo systemctl daemon-reload && \
+             sudo systemctl enable zodiac-bot && \
+             sudo systemctl restart zodiac-bot"

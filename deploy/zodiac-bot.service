@@ -1,0 +1,16 @@
+[Unit]
+Description=Zodiac Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/zodiac-discord-bot
+EnvironmentFile=/etc/zodiac-bot.env
+ExecStart=/opt/zodiac-discord-bot/.venv/bin/python /opt/zodiac-discord-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
