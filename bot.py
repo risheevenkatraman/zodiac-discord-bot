@@ -174,8 +174,12 @@ class ZodiacBot(commands.Bot):
         await self.wait_until_ready()
 
 
-def moderator_only() -> Any:
-    return app_commands.checks.has_permissions(manage_messages=True)
+def administrator_only() -> Any:
+    def decorator(command: Any) -> Any:
+        command = app_commands.default_permissions(administrator=True)(command)
+        return app_commands.checks.has_permissions(administrator=True)(command)
+
+    return decorator
 
 
 def parse_role_permissions(value: str) -> discord.Permissions:
@@ -595,7 +599,7 @@ def register_commands(bot: ZodiacBot) -> None:
         twitch_channel="Channel for Twitch notifications",
         social_role="Role to ping",
     )
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @administrator_only()
     async def setup(
         interaction: discord.Interaction,
         social_channel: discord.TextChannel,
@@ -617,7 +621,7 @@ def register_commands(bot: ZodiacBot) -> None:
         name="create_access",
         description="Interactively create a permissioned role and private channel.",
     )
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @administrator_only()
     @app_commands.guild_only()
     async def create_access(interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(
@@ -628,7 +632,7 @@ def register_commands(bot: ZodiacBot) -> None:
         name="create_channel",
         description="Interactively create a private channel in a category.",
     )
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @administrator_only()
     @app_commands.guild_only()
     async def create_channel(interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(
@@ -637,7 +641,7 @@ def register_commands(bot: ZodiacBot) -> None:
 
     @bot.tree.command(name="delete_role", description="Delete a server role.")
     @app_commands.describe(role="Role to delete")
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @administrator_only()
     @app_commands.guild_only()
     async def delete_role(
         interaction: discord.Interaction, role: discord.Role
@@ -679,7 +683,7 @@ def register_commands(bot: ZodiacBot) -> None:
 
     @bot.tree.command(name="delete_channel", description="Delete a server channel.")
     @app_commands.describe(channel="Channel to delete")
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @administrator_only()
     @app_commands.guild_only()
     async def delete_channel(
         interaction: discord.Interaction, channel: discord.TextChannel
@@ -717,7 +721,7 @@ def register_commands(bot: ZodiacBot) -> None:
         description="Register a Twitch account for live notifications.",
     )
     @app_commands.describe(username="Twitch login name")
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @administrator_only()
     async def add_twitch(interaction: discord.Interaction, username: str) -> None:
         await bot.database.add_twitch_account(
             interaction.guild_id, username.strip().lower()
@@ -729,7 +733,7 @@ def register_commands(bot: ZodiacBot) -> None:
     @bot.tree.command(
         name="remove_twitch", description="Stop notifying for a Twitch account."
     )
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @administrator_only()
     async def remove_twitch(interaction: discord.Interaction, username: str) -> None:
         removed = await bot.database.remove_twitch_account(
             interaction.guild_id, username.strip().lower()
@@ -740,10 +744,25 @@ def register_commands(bot: ZodiacBot) -> None:
         await interaction.response.send_message(message, ephemeral=True)
 
     @bot.tree.command(
+        name="list_twitch",
+        description="Show the Twitch accounts registered for this server.",
+    )
+    @administrator_only()
+    @app_commands.guild_only()
+    async def list_twitch(interaction: discord.Interaction) -> None:
+        accounts = await bot.database.list_twitch_accounts(interaction.guild_id)
+        if not accounts:
+            message = "No Twitch accounts are currently registered."
+        else:
+            usernames = "\n".join(f"- `{account['username']}`" for account in accounts)
+            message = f"Registered Twitch accounts:\n{usernames}"
+        await interaction.response.send_message(message, ephemeral=True)
+
+    @bot.tree.command(
         name="clear", description="Delete recent messages from this channel."
     )
     @app_commands.describe(amount="Number of messages to delete, from 1 to 100")
-    @moderator_only()
+    @administrator_only()
     async def clear(
         interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]
     ) -> None:
@@ -761,7 +780,7 @@ def register_commands(bot: ZodiacBot) -> None:
 
     @bot.tree.command(name="timeout", description="Timeout a member.")
     @app_commands.describe(member="Member to timeout", minutes="Duration in minutes")
-    @app_commands.checks.has_permissions(moderate_members=True)
+    @administrator_only()
     async def timeout(
         interaction: discord.Interaction,
         member: discord.Member,
@@ -776,7 +795,7 @@ def register_commands(bot: ZodiacBot) -> None:
         )
 
     @bot.tree.command(name="kick", description="Kick a member.")
-    @app_commands.checks.has_permissions(kick_members=True)
+    @administrator_only()
     async def kick(
         interaction: discord.Interaction,
         member: discord.Member,
@@ -786,7 +805,7 @@ def register_commands(bot: ZodiacBot) -> None:
         await interaction.response.send_message(f"Kicked {member} ({reason}).")
 
     @bot.tree.command(name="ban", description="Ban a member.")
-    @app_commands.checks.has_permissions(ban_members=True)
+    @administrator_only()
     async def ban(
         interaction: discord.Interaction,
         member: discord.Member,

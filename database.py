@@ -79,9 +79,21 @@ class Database:
             connection.commit()
             return cursor.rowcount > 0
 
-    async def list_twitch_accounts(self) -> list[dict[str, Any]]:
+    async def list_twitch_accounts(
+        self, guild_id: int | None = None
+    ) -> list[dict[str, Any]]:
         async with self.lock:
-            rows = self._require_connection().execute("SELECT guild_id, username FROM twitch_accounts").fetchall()
+            connection = self._require_connection()
+            if guild_id is None:
+                rows = connection.execute(
+                    "SELECT guild_id, username FROM twitch_accounts"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT guild_id, username FROM twitch_accounts "
+                    "WHERE guild_id = ? ORDER BY username",
+                    (guild_id,),
+                ).fetchall()
             return [dict(row) for row in rows]
 
     async def list_guild_ids(self) -> list[int]:

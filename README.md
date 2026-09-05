@@ -29,6 +29,9 @@ and private channels without manually editing permission overwrites.
 
 - `/add_twitch` - Register a Twitch account for live notifications.
 - `/remove_twitch` - Stop monitoring a registered Twitch account.
+- `/list_twitch` - Show all Twitch accounts registered for the server.
+
+All bot commands require the Discord Administrator permission.
 
 ## Features
 
