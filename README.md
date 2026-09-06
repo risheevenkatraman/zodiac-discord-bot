@@ -31,7 +31,22 @@ and private channels without manually editing permission overwrites.
 - `/remove_twitch` - Stop monitoring a registered Twitch account.
 - `/list_twitch` - Show all Twitch accounts registered for the server.
 
-All bot commands require the Discord Administrator permission.
+### Music
+
+- `/play` - Join your voice channel and queue a YouTube video/playlist or Spotify
+  song/playlist URL.
+- `/skip` - Skip the current track.
+- `/pause` and `/resume` - Pause or resume playback.
+- `/leave` - Stop playback, clear the queue, and leave voice.
+
+Spotify links are resolved through the Spotify Web API and searched on YouTube
+for playback. Configure `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` for
+Spotify support. YouTube-only playback does not need Spotify credentials.
+FFmpeg must be installed on the deployment host and `FFMPEG_PATH` must point to
+it when it is not on `PATH`.
+
+All moderation and server-configuration commands require the Discord Administrator
+permission. Music commands are available to server members.
 
 ## Features
 
@@ -60,6 +75,8 @@ All bot commands require the Discord Administrator permission.
 - **aiohttp** - Twitch API requests and the X webhook HTTP server.
 - **Twitch Helix API** - Live-stream monitoring.
 - **python-dotenv** - Environment variable loading.
+- **yt-dlp** - YouTube media metadata and audio-stream extraction.
+- **FFmpeg** - Voice audio transcoding and streaming.
 - **GitHub** - Source control and repository hosting.
 - **GitHub Actions** - Automated deployment workflow.
 - **AWS Lightsail or EC2** - Always-on hosting target.

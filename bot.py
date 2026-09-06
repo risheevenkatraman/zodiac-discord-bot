@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import secrets
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
+import yt_dlp
 from aiohttp import web
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -38,6 +41,9 @@ class Settings:
     twitch_client_id: str | None
     twitch_client_secret: str | None
     twitch_poll_seconds: int
+    spotify_client_id: str | None
+    spotify_client_secret: str | None
+    ffmpeg_path: str
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -55,7 +61,76 @@ class Settings:
             twitch_client_id=twitch_id,
             twitch_client_secret=twitch_secret,
             twitch_poll_seconds=max(30, int(os.getenv("TWITCH_POLL_SECONDS", "60"))),
+            spotify_client_id=os.getenv("SPOTIFY_CLIENT_ID"),
+            spotify_client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
+            ffmpeg_path=os.getenv("FFMPEG_PATH", "ffmpeg"),
         )
+
+
+@dataclass(frozen=True)
+class MusicTrack:
+    source: str
+    title: str
+
+
+class GuildMusicPlayer:
+    def __init__(self, bot: ZodiacBot, guild_id: int) -> None:
+        self.bot = bot
+        self.guild_id = guild_id
+        self.queue: asyncio.Queue[MusicTrack] = asyncio.Queue()
+        self.voice_client: discord.VoiceClient | None = None
+        self.current: MusicTrack | None = None
+        self.player_task = asyncio.create_task(self._run())
+
+    async def enqueue(self, tracks: list[MusicTrack]) -> None:
+        for track in tracks:
+            await self.queue.put(track)
+
+    async def _run(self) -> None:
+        while True:
+            track = await self.queue.get()
+            self.current = track
+            try:
+                await self._play(track)
+            except (discord.ClientException, discord.HTTPException, OSError):
+                LOGGER.exception("Failed to play track in guild %s", self.guild_id)
+            finally:
+                self.current = None
+                self.queue.task_done()
+
+    async def _play(self, track: MusicTrack) -> None:
+        if not self.voice_client or not self.voice_client.is_connected():
+            return
+        info = await self.bot.extract_audio(track.source)
+        stream_url = info.get("url")
+        if not isinstance(stream_url, str):
+            raise RuntimeError(f"No playable audio was found for {track.title}")
+        finished = asyncio.get_running_loop().create_future()
+
+        def after(error: Exception | None) -> None:
+            if error:
+                self.bot.loop.call_soon_threadsafe(finished.set_exception, error)
+            else:
+                self.bot.loop.call_soon_threadsafe(finished.set_result, None)
+
+        source = discord.FFmpegPCMAudio(
+            stream_url,
+            executable=self.bot.settings.ffmpeg_path,
+            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            options="-vn",
+        )
+        self.voice_client.play(source, after=after)
+        await finished
+
+    async def stop(self) -> None:
+        while not self.queue.empty():
+            self.queue.get_nowait()
+            self.queue.task_done()
+        if self.voice_client and self.voice_client.is_playing():
+            self.voice_client.stop()
+        if self.voice_client and self.voice_client.is_connected():
+            await self.voice_client.disconnect()
+        self.player_task.cancel()
 
 
 class ZodiacBot(commands.Bot):
@@ -69,6 +144,8 @@ class ZodiacBot(commands.Bot):
         self.twitch_token: str | None = None
         self.seen_streams: set[tuple[int, str]] = set()
         self.webhook_runner: web.AppRunner | None = None
+        self.music_players: dict[int, GuildMusicPlayer] = {}
+        self.spotify_token: str | None = None
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession()
@@ -81,7 +158,138 @@ class ZodiacBot(commands.Bot):
             await self.webhook_runner.cleanup()
         if self.http_session:
             await self.http_session.close()
+        for player in list(self.music_players.values()):
+            await player.stop()
+        self.music_players.clear()
         await super().close()
+
+    def music_player(self, guild_id: int) -> GuildMusicPlayer:
+        player = self.music_players.get(guild_id)
+        if player is None:
+            player = GuildMusicPlayer(self, guild_id)
+            self.music_players[guild_id] = player
+        return player
+
+    async def extract_audio(self, source: str) -> dict[str, Any]:
+        options = {
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+        }
+        try:
+            result = await asyncio.to_thread(
+                lambda: yt_dlp.YoutubeDL(options).extract_info(source, download=False)
+            )
+        except yt_dlp.utils.DownloadError as error:
+            raise RuntimeError("The media URL could not be played.") from error
+        if not isinstance(result, dict):
+            raise RuntimeError("The media extractor returned no track information")
+        if result.get("entries"):
+            first = next((entry for entry in result["entries"] if isinstance(entry, dict)), None)
+            if first is None:
+                raise RuntimeError("The media extractor returned no playable track")
+            result = first
+        return result
+
+    async def resolve_media(self, url: str) -> list[MusicTrack]:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("Please provide a valid YouTube or Spotify URL.")
+        if parsed.netloc.lower().endswith("spotify.com"):
+            return await self.resolve_spotify(url)
+        options = {
+            "extract_flat": True,
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+        }
+        try:
+            result = await asyncio.to_thread(
+                lambda: yt_dlp.YoutubeDL(options).extract_info(url, download=False)
+            )
+        except yt_dlp.utils.DownloadError as error:
+            raise ValueError("The media URL could not be read.") from error
+        if not isinstance(result, dict):
+            raise RuntimeError("No media was found at that URL.")
+        entries = result.get("entries")
+        if entries:
+            tracks = [
+                MusicTrack(
+                    source=str(entry.get("webpage_url") or entry.get("url")),
+                    title=str(entry.get("title") or "Untitled track"),
+                )
+                for entry in entries
+                if isinstance(entry, dict) and (entry.get("webpage_url") or entry.get("url"))
+            ]
+            if tracks:
+                return tracks
+        webpage_url = result.get("webpage_url") or url
+        return [MusicTrack(source=str(webpage_url), title=str(result.get("title") or url))]
+
+    async def spotify_access_token(self) -> str:
+        if self.spotify_token:
+            return self.spotify_token
+        if not self.http_session or not self.settings.spotify_client_id or not self.settings.spotify_client_secret:
+            raise RuntimeError("Spotify links require SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET.")
+        credentials = base64.b64encode(
+            f"{self.settings.spotify_client_id}:{self.settings.spotify_client_secret}".encode()
+        ).decode()
+        async with self.http_session.post(
+            "https://accounts.spotify.com/api/token",
+            headers={"Authorization": f"Basic {credentials}"},
+            data={"grant_type": "client_credentials"},
+        ) as response:
+            response.raise_for_status()
+            payload = await response.json()
+        token = payload.get("access_token")
+        if not isinstance(token, str):
+            raise RuntimeError("Spotify did not return an access token.")
+        self.spotify_token = token
+        return token
+
+    async def resolve_spotify(self, url: str) -> list[MusicTrack]:
+        parsed = urlparse(url)
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts and parts[0].startswith("intl-"):
+            parts = parts[1:]
+        if len(parts) < 2 or parts[0] not in {"track", "playlist"}:
+            raise ValueError("Only Spotify song and playlist links are supported.")
+        token = await self.spotify_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        endpoint = f"https://api.spotify.com/v1/{parts[0]}s/{parts[1]}"
+        assert self.http_session is not None
+        async with self.http_session.get(endpoint, headers=headers) as response:
+            if response.status == 401:
+                self.spotify_token = None
+                raise RuntimeError("Spotify authorization expired; please try again.")
+            response.raise_for_status()
+            payload = await response.json()
+        if parts[0] == "track":
+            items = [payload]
+        else:
+            items = payload.get("tracks", {}).get("items", [])
+            next_url = payload.get("tracks", {}).get("next")
+            while isinstance(next_url, str):
+                async with self.http_session.get(next_url, headers=headers) as response:
+                    response.raise_for_status()
+                    page = await response.json()
+                items.extend(page.get("items", []))
+                next_url = page.get("next")
+        tracks: list[MusicTrack] = []
+        for item in items:
+            if parts[0] == "playlist" and isinstance(item, dict):
+                item = item.get("track", item)
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            artists = ", ".join(
+                artist["name"] for artist in item.get("artists", []) if isinstance(artist, dict)
+            )
+            query = f"ytsearch1:{artists} - {item['name']}"
+            tracks.append(MusicTrack(source=query, title=f"{artists} - {item['name']}"))
+        if not tracks:
+            raise RuntimeError("No playable tracks were found in that Spotify link.")
+        return tracks
 
     async def on_ready(self) -> None:
         LOGGER.info(
@@ -590,6 +798,89 @@ class ChannelSetupView(discord.ui.View):
 
 
 def register_commands(bot: ZodiacBot) -> None:
+    @bot.tree.command(
+        name="play", description="Join your voice channel and play a YouTube or Spotify link."
+    )
+    @app_commands.describe(url="A YouTube video/playlist or Spotify song/playlist URL")
+    @app_commands.guild_only()
+    async def play(interaction: discord.Interaction, url: str) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
+            await interaction.response.send_message(
+                "Join a voice channel first.", ephemeral=True
+            )
+            return
+        channel = member.voice.channel
+        if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            await interaction.response.send_message(
+                "I can only join a standard voice or stage channel.", ephemeral=True
+            )
+            return
+        voice_client = interaction.guild.voice_client if interaction.guild else None
+        if voice_client and voice_client.channel != channel:
+            await interaction.response.send_message(
+                "I am already playing in another voice channel.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        try:
+            tracks = await bot.resolve_media(url.strip())
+            player = bot.music_player(interaction.guild_id)
+            if voice_client is None:
+                player.voice_client = await channel.connect()
+            else:
+                player.voice_client = voice_client
+            await player.enqueue(tracks)
+        except (ValueError, RuntimeError, discord.ClientException, discord.HTTPException) as error:
+            LOGGER.warning("Could not queue media in guild %s: %s", interaction.guild_id, error)
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        if len(tracks) == 1:
+            message = f"Queued **{tracks[0].title}**."
+        else:
+            message = f"Queued **{len(tracks)} tracks**."
+        await interaction.followup.send(message)
+
+    @bot.tree.command(name="skip", description="Skip the currently playing track.")
+    @app_commands.guild_only()
+    async def skip(interaction: discord.Interaction) -> None:
+        player = bot.music_players.get(interaction.guild_id)
+        if not player or not player.voice_client or not player.voice_client.is_playing():
+            await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+            return
+        player.voice_client.stop()
+        await interaction.response.send_message("Skipped.")
+
+    @bot.tree.command(name="pause", description="Pause the currently playing track.")
+    @app_commands.guild_only()
+    async def pause(interaction: discord.Interaction) -> None:
+        player = bot.music_players.get(interaction.guild_id)
+        if not player or not player.voice_client or not player.voice_client.is_playing():
+            await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+            return
+        player.voice_client.pause()
+        await interaction.response.send_message("Paused.")
+
+    @bot.tree.command(name="resume", description="Resume paused music.")
+    @app_commands.guild_only()
+    async def resume(interaction: discord.Interaction) -> None:
+        player = bot.music_players.get(interaction.guild_id)
+        if not player or not player.voice_client or not player.voice_client.is_paused():
+            await interaction.response.send_message("Nothing is paused.", ephemeral=True)
+            return
+        player.voice_client.resume()
+        await interaction.response.send_message("Resumed.")
+
+    @bot.tree.command(name="leave", description="Stop music and leave the voice channel.")
+    @app_commands.guild_only()
+    async def leave(interaction: discord.Interaction) -> None:
+        player = bot.music_players.pop(interaction.guild_id, None)
+        if not player:
+            await interaction.response.send_message("I am not in a voice channel.", ephemeral=True)
+            return
+        await player.stop()
+        await interaction.response.send_message("Stopped playback and left the voice channel.")
+
     @bot.tree.command(
         name="setup",
         description="Configure channels and the social media notification role.",
