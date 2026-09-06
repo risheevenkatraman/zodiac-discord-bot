@@ -39,12 +39,6 @@ and private channels without manually editing permission overwrites.
 - `/pause` and `/resume` - Pause or resume playback.
 - `/leave` - Stop playback, clear the queue, and leave voice.
 
-Spotify links are resolved through the Spotify Web API and searched on YouTube
-for playback. Configure `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` for
-Spotify support. YouTube-only playback does not need Spotify credentials.
-FFmpeg must be installed on the deployment host and `FFMPEG_PATH` must point to
-it when it is not on `PATH`.
-
 All moderation and server-configuration commands require the Discord Administrator
 permission. Music commands are available to server members.
 
