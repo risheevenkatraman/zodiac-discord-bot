@@ -410,14 +410,14 @@ async def publish_confirmation(
 ) -> None:
     """Post a successful command result publicly and dismiss private command UI."""
     if interaction.response.is_done():
-        if isinstance(interaction.channel, discord.abc.Messageable):
-            await interaction.channel.send(message)
-        else:
-            await interaction.followup.send(message, ephemeral=False)
+        await interaction.followup.send(message, ephemeral=False, wait=True)
     else:
         await interaction.response.send_message(message)
     if dismiss_original and interaction.response.is_done():
-        await interaction.delete_original_response()
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            LOGGER.debug("Deferred interaction response was already dismissed.")
 
 
 def parse_role_permissions(value: str) -> discord.Permissions:
