@@ -390,6 +390,21 @@ def administrator_only() -> Any:
     return decorator
 
 
+async def publish_confirmation(
+    interaction: discord.Interaction,
+    message: str,
+    *,
+    dismiss_original: bool = False,
+) -> None:
+    """Post a successful command result publicly and dismiss private command UI."""
+    if interaction.response.is_done():
+        await interaction.followup.send(message)
+    else:
+        await interaction.response.send_message(message)
+    if dismiss_original:
+        await interaction.delete_original_response()
+
+
 def parse_role_permissions(value: str) -> discord.Permissions:
     requested = {item.strip().lower() for item in value.split(",") if item.strip()}
     if not requested:
@@ -664,15 +679,17 @@ class RoleSetupView(discord.ui.View):
                 "permissions, then try again.",
                 ephemeral=True,
             )
+            await interaction.delete_original_response()
             return
 
         self.disable_all_items()
-        await interaction.followup.send(
-            f"Created {role.mention} with the requested permissions and color.",
-            ephemeral=True,
-        )
         if self.message:
             await self.message.edit(view=self)
+        await publish_confirmation(
+            interaction,
+            f"Created {role.mention} with the requested permissions and color.",
+            dismiss_original=True,
+        )
 
     async def on_timeout(self) -> None:
         self.disable_all_items()
@@ -919,16 +936,18 @@ class RoleEditView(discord.ui.View):
                 "Check my role position and permissions.",
                 ephemeral=True,
             )
+            await interaction.delete_original_response()
             return
 
         self.disable_all_items()
-        await interaction.followup.send(
-            f"Updated {self.role.mention} permissions and access for "
-            f"{len(selected_channels)} channel(s).",
-            ephemeral=True,
-        )
         if self.message:
             await self.message.edit(view=self)
+        await publish_confirmation(
+            interaction,
+            f"Updated {self.role.mention} permissions and access for "
+            f"{len(selected_channels)} channel(s).",
+            dismiss_original=True,
+        )
 
     async def on_timeout(self) -> None:
         self.disable_all_items()
@@ -1163,16 +1182,18 @@ class ChannelSetupView(discord.ui.View):
                 "permissions and try again.",
                 ephemeral=True,
             )
+            await interaction.delete_original_response()
             return
 
         self.disable_all_items()
-        await interaction.followup.send(
-            f"Created {channel.mention} in {category.name} with access for the "
-            "selected roles.",
-            ephemeral=True,
-        )
         if self.message:
             await self.message.edit(view=self)
+        await publish_confirmation(
+            interaction,
+            f"Created {channel.mention} in {category.name} with access for the "
+            "selected roles.",
+            dismiss_original=True,
+        )
 
     async def on_timeout(self) -> None:
         self.disable_all_items()
@@ -1217,12 +1238,13 @@ def register_commands(bot: ZodiacBot) -> None:
         except (ValueError, RuntimeError, discord.ClientException, discord.HTTPException) as error:
             LOGGER.warning("Could not queue media in guild %s: %s", interaction.guild_id, error)
             await interaction.followup.send(str(error), ephemeral=True)
+            await interaction.delete_original_response()
             return
         if len(tracks) == 1:
             message = f"Queued **{tracks[0].title}**."
         else:
             message = f"Queued **{len(tracks)} tracks**."
-        await interaction.followup.send(message)
+        await publish_confirmation(interaction, message, dismiss_original=True)
 
     @bot.tree.command(name="skip", description="Skip the currently playing track.")
     @app_commands.guild_only()
@@ -1232,7 +1254,7 @@ def register_commands(bot: ZodiacBot) -> None:
             await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
             return
         player.voice_client.stop()
-        await interaction.response.send_message("Skipped.")
+        await publish_confirmation(interaction, "Skipped.")
 
     @bot.tree.command(name="pause", description="Pause the currently playing track.")
     @app_commands.guild_only()
@@ -1242,7 +1264,7 @@ def register_commands(bot: ZodiacBot) -> None:
             await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
             return
         player.voice_client.pause()
-        await interaction.response.send_message("Paused.")
+        await publish_confirmation(interaction, "Paused.")
 
     @bot.tree.command(name="resume", description="Resume paused music.")
     @app_commands.guild_only()
@@ -1252,7 +1274,7 @@ def register_commands(bot: ZodiacBot) -> None:
             await interaction.response.send_message("Nothing is paused.", ephemeral=True)
             return
         player.voice_client.resume()
-        await interaction.response.send_message("Resumed.")
+        await publish_confirmation(interaction, "Resumed.")
 
     @bot.tree.command(name="leave", description="Stop music and leave the voice channel.")
     @app_commands.guild_only()
@@ -1262,7 +1284,9 @@ def register_commands(bot: ZodiacBot) -> None:
             await interaction.response.send_message("I am not in a voice channel.", ephemeral=True)
             return
         await player.stop()
-        await interaction.response.send_message("Stopped playback and left the voice channel.")
+        await publish_confirmation(
+            interaction, "Stopped playback and left the voice channel."
+        )
 
     @bot.tree.command(
         name="setup",
@@ -1287,8 +1311,9 @@ def register_commands(bot: ZodiacBot) -> None:
             interaction.guild_id, "twitch", twitch_channel.id
         )
         await bot.database.set_role(interaction.guild_id, "social", social_role.id)
-        await interaction.response.send_message(
-            "Zodiac notification channels and role saved.", ephemeral=True
+        await publish_confirmation(
+            interaction,
+            "Saved the Zodiac notification channels and social media notification role.",
         )
 
     @bot.tree.command(
@@ -1440,7 +1465,7 @@ def register_commands(bot: ZodiacBot) -> None:
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message(f"Deleted the `{role.name}` role.")
+        await publish_confirmation(interaction, f"Deleted the `{role.name}` role.")
 
     @bot.tree.command(name="delete_channel", description="Delete a server channel.")
     @app_commands.describe(channel="Channel to delete")
@@ -1473,9 +1498,7 @@ def register_commands(bot: ZodiacBot) -> None:
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message(
-            f"Deleted the `#{channel.name}` channel.", ephemeral=True
-        )
+        await publish_confirmation(interaction, f"Deleted the `#{channel.name}` channel.")
 
     @bot.tree.command(
         name="add_twitch",
@@ -1487,9 +1510,7 @@ def register_commands(bot: ZodiacBot) -> None:
         await bot.database.add_twitch_account(
             interaction.guild_id, username.strip().lower()
         )
-        await interaction.response.send_message(
-            f"Registered Twitch account `{username}`.", ephemeral=True
-        )
+        await publish_confirmation(interaction, f"Registered Twitch account `{username}`.")
 
     @bot.tree.command(
         name="remove_twitch", description="Stop notifying for a Twitch account."
@@ -1502,7 +1523,7 @@ def register_commands(bot: ZodiacBot) -> None:
         message = (
             f"Removed `{username}`." if removed else f"`{username}` was not registered."
         )
-        await interaction.response.send_message(message, ephemeral=True)
+        await publish_confirmation(interaction, message)
 
     @bot.tree.command(
         name="list_twitch",
@@ -1517,7 +1538,7 @@ def register_commands(bot: ZodiacBot) -> None:
         else:
             usernames = "\n".join(f"- `{account['username']}`" for account in accounts)
             message = f"Registered Twitch accounts:\n{usernames}"
-        await interaction.response.send_message(message, ephemeral=True)
+        await publish_confirmation(interaction, message)
 
     @bot.tree.command(
         name="clear", description="Delete recent messages from this channel."
@@ -1535,8 +1556,8 @@ def register_commands(bot: ZodiacBot) -> None:
             return
         await interaction.response.defer(ephemeral=True)
         deleted = await channel.purge(limit=amount)
-        await interaction.followup.send(
-            f"Deleted {len(deleted)} messages.", ephemeral=True
+        await publish_confirmation(
+            interaction, f"Deleted {len(deleted)} messages.", dismiss_original=True
         )
 
     @bot.tree.command(name="timeout", description="Timeout a member.")
@@ -1586,6 +1607,7 @@ def register_commands(bot: ZodiacBot) -> None:
             message = "The command failed. Check the bot logs for details."
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
+            await interaction.delete_original_response()
         else:
             await interaction.response.send_message(message, ephemeral=True)
 
