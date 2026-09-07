@@ -676,7 +676,7 @@ class RoleSetupView(discord.ui.View):
             )
             return
 
-        await interaction.response.edit_message(view=None)
+        await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             role = await guild.create_role(
                 name=self.role_name,
@@ -923,7 +923,7 @@ class RoleEditView(discord.ui.View):
                 for permission in discord.Permissions.VALID_FLAGS
             }
         )
-        await interaction.response.edit_message(view=None)
+        await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             await self.role.edit(
                 permissions=permissions,
@@ -1177,7 +1177,7 @@ class ChannelSetupView(discord.ui.View):
                 read_message_history=True,
             )
 
-        await interaction.response.edit_message(view=None)
+        await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             channel = await guild.create_text_channel(
                 self.channel_name,
