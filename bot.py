@@ -698,8 +698,9 @@ class RoleSetupView(discord.ui.View):
         await publish_confirmation(
             interaction,
             f"Created {role.mention} with the requested permissions and color.",
-            dismiss_original=True,
         )
+        if self.message:
+            await self.message.delete()
 
     async def on_timeout(self) -> None:
         self.disable_all_items()
@@ -954,8 +955,9 @@ class RoleEditView(discord.ui.View):
             interaction,
             f"Updated {self.role.mention} permissions and access for "
             f"{len(selected_channels)} channel(s).",
-            dismiss_original=True,
         )
+        if self.message:
+            await self.message.delete()
 
     async def on_timeout(self) -> None:
         self.disable_all_items()
@@ -1198,8 +1200,9 @@ class ChannelSetupView(discord.ui.View):
             interaction,
             f"Created {channel.mention} in {category.name} with access for the "
             "selected roles.",
-            dismiss_original=True,
         )
+        if self.message:
+            await self.message.delete()
 
     async def on_timeout(self) -> None:
         self.disable_all_items()
