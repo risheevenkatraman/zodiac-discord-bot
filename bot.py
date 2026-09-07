@@ -142,7 +142,7 @@ class ZodiacBot(commands.Bot):
         self.database = database
         self.http_session: aiohttp.ClientSession | None = None
         self.twitch_token: str | None = None
-        self.seen_streams: set[tuple[int, str]] = set()
+        self.active_twitch_accounts: set[tuple[int, str]] = set()
         self.webhook_runner: web.AppRunner | None = None
         self.music_players: dict[int, GuildMusicPlayer] = {}
         self.spotify_token: str | None = None
@@ -360,15 +360,17 @@ class ZodiacBot(commands.Bot):
                 return
             response.raise_for_status()
             streams: list[dict[str, Any]] = (await response.json()).get("data", [])
-        account_map = {account["username"].lower(): account for account in accounts}
+        account_map = {account["username"].casefold(): account for account in accounts}
+        currently_live: set[tuple[int, str]] = set()
         for stream in streams:
-            account = account_map.get(stream["user_login"].lower())
+            username = stream["user_login"].casefold()
+            account = account_map.get(username)
             if not account:
                 continue
-            key = (account["guild_id"], stream["id"])
-            if key in self.seen_streams:
+            key = (account["guild_id"], username)
+            currently_live.add(key)
+            if key in self.active_twitch_accounts:
                 continue
-            self.seen_streams.add(key)
             role_id = await self.database.get_role(account["guild_id"], "social")
             await self.post_to_configured_channel(
                 account["guild_id"],
@@ -376,6 +378,7 @@ class ZodiacBot(commands.Bot):
                 kind="twitch",
                 role_id=role_id,
             )
+        self.active_twitch_accounts = currently_live
 
     @twitch_poll_loop.before_loop
     async def before_twitch_poll_loop(self) -> None:
