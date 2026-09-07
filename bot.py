@@ -431,11 +431,6 @@ class AccessSetupModal(discord.ui.Modal, title="Create role"):
         default="#5865F2",
         max_length=7,
     )
-    permissions = discord.ui.TextInput(
-        label="Role permissions (comma-separated)",
-        placeholder="view_channel, send_messages, read_message_history",
-        max_length=500,
-    )
 
     def __init__(self, owner_id: int, bot: ZodiacBot) -> None:
         super().__init__()
@@ -449,26 +444,158 @@ class AccessSetupModal(discord.ui.Modal, title="Create role"):
             )
             return
         try:
-            permissions = parse_role_permissions(str(self.permissions))
             color = parse_role_color(str(self.role_color))
         except ValueError as error:
             await interaction.response.send_message(str(error), ephemeral=True)
             return
 
-        view = RoleSetupView(
+        view = PermissionSetupView(
             owner_id=self.owner_id,
             bot=self.bot,
             role_name=str(self.role_name).strip(),
-            permissions=permissions,
             color=color,
         )
         await interaction.response.send_message(
-            "Review the role details, then click **Create**. This command creates "
-            "only the role; use `/create_channel` separately for channels.",
+            "Select the permissions for the role, then click **Continue**.",
             view=view,
             ephemeral=True,
         )
         view.message = await interaction.original_response()
+
+
+class PermissionSelect(discord.ui.Select):
+    def __init__(self, setup_view: PermissionSetupView) -> None:
+        self.setup_view = setup_view
+        super().__init__(
+            placeholder="Choose permissions",
+            min_values=0,
+            max_values=len(setup_view.permission_pages[setup_view.permission_page]),
+            options=self.build_options(),
+            row=0,
+        )
+
+    def build_options(self) -> list[discord.SelectOption]:
+        page_permissions = self.setup_view.permission_pages[
+            self.setup_view.permission_page
+        ]
+        return [
+            discord.SelectOption(
+                label=permission.replace("_", " ").title(),
+                value=permission,
+                default=permission in self.setup_view.selected_permissions,
+            )
+            for permission in page_permissions
+        ]
+
+    def refresh_options(self) -> None:
+        self.options = self.build_options()
+        self.max_values = len(
+            self.setup_view.permission_pages[self.setup_view.permission_page]
+        )
+        self.placeholder = (
+            f"Choose permissions (page {self.setup_view.permission_page + 1}/"
+            f"{len(self.setup_view.permission_pages)})"
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        page_permissions = set(
+            self.setup_view.permission_pages[self.setup_view.permission_page]
+        )
+        self.setup_view.selected_permissions.difference_update(page_permissions)
+        self.setup_view.selected_permissions.update(self.values)
+        self.setup_view.refresh_permission_controls()
+        await interaction.response.edit_message(view=self.setup_view)
+
+
+class PermissionSetupView(discord.ui.View):
+    def __init__(
+        self,
+        owner_id: int,
+        bot: ZodiacBot,
+        role_name: str,
+        color: discord.Colour,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.bot = bot
+        self.role_name = role_name
+        self.color = color
+        self.selected_permissions: set[str] = set()
+        self.message: discord.WebhookMessage | None = None
+        permissions = sorted(discord.Permissions.VALID_FLAGS)
+        self.permission_pages = [
+            permissions[index : index + 25]
+            for index in range(0, len(permissions), 25)
+        ]
+        self.permission_page = 0
+        self.permission_select = PermissionSelect(self)
+        self.add_item(self.permission_select)
+        self.refresh_permission_controls()
+
+    def refresh_permission_controls(self) -> None:
+        self.permission_select.refresh_options()
+        self.previous_page.disabled = self.permission_page == 0
+        self.next_page.disabled = self.permission_page == len(self.permission_pages) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "Only the person who opened this setup can use it.", ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(
+        label="Previous permissions", style=discord.ButtonStyle.secondary, row=1
+    )
+    async def previous_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.permission_page -= 1
+        self.refresh_permission_controls()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(
+        label="Next permissions", style=discord.ButtonStyle.secondary, row=1
+    )
+    async def next_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.permission_page += 1
+        self.refresh_permission_controls()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Continue", style=discord.ButtonStyle.success, row=2)
+    async def continue_setup(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self.selected_permissions:
+            await interaction.response.send_message(
+                "Select at least one permission first.", ephemeral=True
+            )
+            return
+        view = RoleSetupView(
+            owner_id=self.owner_id,
+            bot=self.bot,
+            role_name=self.role_name,
+            permissions=discord.Permissions(
+                **{permission: True for permission in self.selected_permissions}
+            ),
+            color=self.color,
+        )
+        await interaction.response.edit_message(
+            content=(
+                "Review the role details, then click **Create**. This command creates "
+                "only the role; use `/create_channel` separately for channels."
+            ),
+            view=view,
+        )
+        view.message = await interaction.original_response()
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message:
+            await self.message.edit(view=self)
 
 
 class RoleSetupView(discord.ui.View):
