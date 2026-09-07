@@ -142,7 +142,6 @@ class ZodiacBot(commands.Bot):
         self.database = database
         self.http_session: aiohttp.ClientSession | None = None
         self.twitch_token: str | None = None
-        self.active_twitch_accounts: set[tuple[int, str]] = set()
         self.webhook_runner: web.AppRunner | None = None
         self.music_players: dict[int, GuildMusicPlayer] = {}
         self.spotify_token: str | None = None
@@ -369,16 +368,26 @@ class ZodiacBot(commands.Bot):
                 continue
             key = (account["guild_id"], username)
             currently_live.add(key)
-            if key in self.active_twitch_accounts:
+        new_live_accounts = await self.database.sync_twitch_live_accounts(currently_live)
+        for stream in streams:
+            username = stream["user_login"].casefold()
+            account = account_map.get(username)
+            if not account:
+                continue
+            key = (account["guild_id"], username)
+            if key not in new_live_accounts:
                 continue
             role_id = await self.database.get_role(account["guild_id"], "social")
-            await self.post_to_configured_channel(
-                account["guild_id"],
-                f"**{stream['user_name']} is live:** https://twitch.tv/{stream['user_login']}",
-                kind="twitch",
-                role_id=role_id,
-            )
-        self.active_twitch_accounts = currently_live
+            try:
+                await self.post_to_configured_channel(
+                    account["guild_id"],
+                    f"**{stream['user_name']} is live:** https://twitch.tv/{stream['user_login']}",
+                    kind="twitch",
+                    role_id=role_id,
+                )
+            except (discord.HTTPException, RuntimeError):
+                await self.database.remove_twitch_live_account(*key)
+                raise
 
     @twitch_poll_loop.before_loop
     async def before_twitch_poll_loop(self) -> None:
@@ -403,7 +412,7 @@ async def publish_confirmation(
     if dismiss_original and interaction.response.is_done():
         await interaction.delete_original_response()
     if interaction.response.is_done():
-        await interaction.followup.send(message)
+        await interaction.followup.send(message, ephemeral=False)
     else:
         await interaction.response.send_message(message)
 
@@ -1517,8 +1526,12 @@ def register_commands(bot: ZodiacBot) -> None:
     )
     @administrator_only()
     async def remove_twitch(interaction: discord.Interaction, username: str) -> None:
+        normalized_username = username.strip().casefold()
         removed = await bot.database.remove_twitch_account(
-            interaction.guild_id, username.strip().lower()
+            interaction.guild_id, normalized_username
+        )
+        await bot.database.remove_twitch_live_account(
+            interaction.guild_id, normalized_username
         )
         message = (
             f"Removed `{username}`." if removed else f"`{username}` was not registered."

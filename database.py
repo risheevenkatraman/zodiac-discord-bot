@@ -35,6 +35,11 @@ class Database:
                 username TEXT NOT NULL,
                 PRIMARY KEY (guild_id, username)
             );
+            CREATE TABLE IF NOT EXISTS twitch_live_notifications (
+                guild_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                PRIMARY KEY (guild_id, username)
+            );
             """
         )
         self.connection.commit()
@@ -95,6 +100,34 @@ class Database:
                     (guild_id,),
                 ).fetchall()
             return [dict(row) for row in rows]
+
+    async def sync_twitch_live_accounts(
+        self, live_accounts: set[tuple[int, str]]
+    ) -> set[tuple[int, str]]:
+        async with self.lock:
+            connection = self._require_connection()
+            existing = {
+                (int(row["guild_id"]), str(row["username"]))
+                for row in connection.execute(
+                    "SELECT guild_id, username FROM twitch_live_notifications"
+                ).fetchall()
+            }
+            connection.execute("DELETE FROM twitch_live_notifications")
+            connection.executemany(
+                "INSERT INTO twitch_live_notifications (guild_id, username) VALUES (?, ?)",
+                sorted(live_accounts),
+            )
+            connection.commit()
+            return live_accounts - existing
+
+    async def remove_twitch_live_account(self, guild_id: int, username: str) -> None:
+        async with self.lock:
+            connection = self._require_connection()
+            connection.execute(
+                "DELETE FROM twitch_live_notifications WHERE guild_id = ? AND username = ?",
+                (guild_id, username),
+            )
+            connection.commit()
 
     async def list_guild_ids(self) -> list[int]:
         async with self.lock:
