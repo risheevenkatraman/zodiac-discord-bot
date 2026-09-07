@@ -1309,7 +1309,7 @@ def register_commands(bot: ZodiacBot) -> None:
     @app_commands.describe(role="Role to edit")
     @administrator_only()
     @app_commands.guild_only()
-    async def edit_role(interaction: discord.Interaction, role: discord.Role) -> None:
+    async def edit_role(interaction: discord.Interaction, role: str) -> None:
         guild = interaction.guild
         member = guild.me if guild else None
         if guild is None or member is None:
@@ -1317,6 +1317,13 @@ def register_commands(bot: ZodiacBot) -> None:
                 "This command can only be used in a server.", ephemeral=True
             )
             return
+        selected_role = guild.get_role(int(role)) if role.isdigit() else None
+        if selected_role is None:
+            await interaction.response.send_message(
+                "Select a valid role from the server.", ephemeral=True
+            )
+            return
+        role = selected_role
         if role == guild.default_role:
             await interaction.response.send_message(
                 "The @everyone role cannot be edited.", ephemeral=True
@@ -1363,6 +1370,24 @@ def register_commands(bot: ZodiacBot) -> None:
             ephemeral=True,
         )
         view.message = await interaction.original_response()
+
+    @edit_role.autocomplete("role")
+    async def edit_role_autocomplete(
+        interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        guild = interaction.guild
+        if guild is None:
+            return []
+        search = current.casefold().strip()
+        roles = [
+            role
+            for role in reversed(guild.roles)
+            if not search or search in role.name.casefold()
+        ]
+        return [
+            app_commands.Choice(name=role.name[:100], value=str(role.id))
+            for role in roles[:25]
+        ]
 
     @bot.tree.command(
         name="create_channel",
