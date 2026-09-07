@@ -409,8 +409,8 @@ async def publish_confirmation(
     dismiss_original: bool = False,
 ) -> None:
     """Post a successful command result publicly and dismiss private command UI."""
-    if isinstance(interaction.channel, discord.TextChannel):
-        await interaction.channel.send(message)
+    if interaction.response.is_done():
+        await interaction.followup.send(message)
     else:
         await interaction.response.send_message(message)
     if dismiss_original and interaction.response.is_done():
@@ -676,6 +676,9 @@ class RoleSetupView(discord.ui.View):
             )
             return
 
+        if self.message:
+            await self.message.delete()
+            self.message = None
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             role = await guild.create_role(
@@ -700,9 +703,6 @@ class RoleSetupView(discord.ui.View):
             f"Created {role.mention} with the requested permissions and color.",
             dismiss_original=True,
         )
-        if self.message:
-            await self.message.delete()
-
     async def on_timeout(self) -> None:
         self.disable_all_items()
         if self.message:
@@ -924,6 +924,9 @@ class RoleEditView(discord.ui.View):
                 for permission in discord.Permissions.VALID_FLAGS
             }
         )
+        if self.message:
+            await self.message.delete()
+            self.message = None
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             await self.role.edit(
@@ -958,9 +961,6 @@ class RoleEditView(discord.ui.View):
             f"{len(selected_channels)} channel(s).",
             dismiss_original=True,
         )
-        if self.message:
-            await self.message.delete()
-
     async def on_timeout(self) -> None:
         self.disable_all_items()
         if self.message:
@@ -1179,6 +1179,9 @@ class ChannelSetupView(discord.ui.View):
                 read_message_history=True,
             )
 
+        if self.message:
+            await self.message.delete()
+            self.message = None
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             channel = await guild.create_text_channel(
@@ -1204,9 +1207,6 @@ class ChannelSetupView(discord.ui.View):
             "selected roles.",
             dismiss_original=True,
         )
-        if self.message:
-            await self.message.delete()
-
     async def on_timeout(self) -> None:
         self.disable_all_items()
         if self.message:
