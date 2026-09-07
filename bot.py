@@ -410,7 +410,10 @@ async def publish_confirmation(
 ) -> None:
     """Post a successful command result publicly and dismiss private command UI."""
     if interaction.response.is_done():
-        await interaction.followup.send(message)
+        if isinstance(interaction.channel, discord.abc.Messageable):
+            await interaction.channel.send(message)
+        else:
+            await interaction.followup.send(message, ephemeral=False)
     else:
         await interaction.response.send_message(message)
     if dismiss_original and interaction.response.is_done():
@@ -676,10 +679,10 @@ class RoleSetupView(discord.ui.View):
             )
             return
 
+        await interaction.response.defer(thinking=True, ephemeral=True)
         if self.message:
             await self.message.delete()
             self.message = None
-        await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             role = await guild.create_role(
                 name=self.role_name,
@@ -687,6 +690,7 @@ class RoleSetupView(discord.ui.View):
                 colour=self.color,
                 reason=f"Access setup by {interaction.user}",
             )
+            role = await guild.fetch_role(role.id)
         except discord.HTTPException:
             LOGGER.exception("Failed to create role in guild %s", guild.id)
             await interaction.followup.send(
@@ -924,12 +928,12 @@ class RoleEditView(discord.ui.View):
                 for permission in discord.Permissions.VALID_FLAGS
             }
         )
+        await interaction.response.defer(thinking=True, ephemeral=True)
         if self.message:
             await self.message.delete()
             self.message = None
-        await interaction.response.defer(thinking=True, ephemeral=True)
         try:
-            await self.role.edit(
+            self.role = await self.role.edit(
                 permissions=permissions,
                 reason=f"Role edited by {interaction.user}",
             )
@@ -944,6 +948,7 @@ class RoleEditView(discord.ui.View):
                     overwrite=overwrite,
                     reason=f"Role channel access edited by {interaction.user}",
                 )
+            self.role = await guild.fetch_role(self.role.id)
         except discord.HTTPException:
             LOGGER.exception("Failed to edit role %s in guild %s", self.role.id, guild.id)
             await interaction.followup.send(
@@ -1179,10 +1184,10 @@ class ChannelSetupView(discord.ui.View):
                 read_message_history=True,
             )
 
+        await interaction.response.defer(thinking=True, ephemeral=True)
         if self.message:
             await self.message.delete()
             self.message = None
-        await interaction.response.defer(thinking=True, ephemeral=True)
         try:
             channel = await guild.create_text_channel(
                 self.channel_name,
@@ -1190,6 +1195,21 @@ class ChannelSetupView(discord.ui.View):
                 overwrites=overwrites,
                 reason=f"Channel setup by {interaction.user}",
             )
+            fetched_channel = await guild.fetch_channel(channel.id)
+            if not isinstance(fetched_channel, discord.TextChannel):
+                LOGGER.error(
+                    "Created channel %s was returned as %s",
+                    channel.id,
+                    type(fetched_channel).__name__,
+                )
+                await interaction.followup.send(
+                    "The channel was created, but Discord returned an unexpected "
+                    "channel type while confirming it.",
+                    ephemeral=True,
+                )
+                await interaction.delete_original_response()
+                return
+            channel = fetched_channel
         except discord.HTTPException:
             LOGGER.exception("Failed to create channel in guild %s", guild.id)
             await interaction.followup.send(
