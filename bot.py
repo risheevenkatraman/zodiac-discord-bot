@@ -676,7 +676,7 @@ class RoleSetupView(discord.ui.View):
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.edit_message(view=None)
         try:
             role = await guild.create_role(
                 name=self.role_name,
@@ -698,9 +698,8 @@ class RoleSetupView(discord.ui.View):
         await publish_confirmation(
             interaction,
             f"Created {role.mention} with the requested permissions and color.",
+            dismiss_original=True,
         )
-        if self.message:
-            await self.message.delete()
 
     async def on_timeout(self) -> None:
         self.disable_all_items()
@@ -923,7 +922,7 @@ class RoleEditView(discord.ui.View):
                 for permission in discord.Permissions.VALID_FLAGS
             }
         )
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.edit_message(view=None)
         try:
             await self.role.edit(
                 permissions=permissions,
@@ -955,9 +954,8 @@ class RoleEditView(discord.ui.View):
             interaction,
             f"Updated {self.role.mention} permissions and access for "
             f"{len(selected_channels)} channel(s).",
+            dismiss_original=True,
         )
-        if self.message:
-            await self.message.delete()
 
     async def on_timeout(self) -> None:
         self.disable_all_items()
@@ -1177,7 +1175,7 @@ class ChannelSetupView(discord.ui.View):
                 read_message_history=True,
             )
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.edit_message(view=None)
         try:
             channel = await guild.create_text_channel(
                 self.channel_name,
@@ -1200,9 +1198,8 @@ class ChannelSetupView(discord.ui.View):
             interaction,
             f"Created {channel.mention} in {category.name} with access for the "
             "selected roles.",
+            dismiss_original=True,
         )
-        if self.message:
-            await self.message.delete()
 
     async def on_timeout(self) -> None:
         self.disable_all_items()
