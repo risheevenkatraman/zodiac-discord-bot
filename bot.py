@@ -409,12 +409,12 @@ async def publish_confirmation(
     dismiss_original: bool = False,
 ) -> None:
     """Post a successful command result publicly and dismiss private command UI."""
-    if dismiss_original and interaction.response.is_done():
-        await interaction.delete_original_response()
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=False)
+    if isinstance(interaction.channel, discord.TextChannel):
+        await interaction.channel.send(message)
     else:
         await interaction.response.send_message(message)
+    if dismiss_original and interaction.response.is_done():
+        await interaction.delete_original_response()
 
 
 def parse_role_permissions(value: str) -> discord.Permissions:
@@ -698,6 +698,7 @@ class RoleSetupView(discord.ui.View):
         await publish_confirmation(
             interaction,
             f"Created {role.mention} with the requested permissions and color.",
+            dismiss_original=True,
         )
         if self.message:
             await self.message.delete()
@@ -955,6 +956,7 @@ class RoleEditView(discord.ui.View):
             interaction,
             f"Updated {self.role.mention} permissions and access for "
             f"{len(selected_channels)} channel(s).",
+            dismiss_original=True,
         )
         if self.message:
             await self.message.delete()
@@ -1200,6 +1202,7 @@ class ChannelSetupView(discord.ui.View):
             interaction,
             f"Created {channel.mention} in {category.name} with access for the "
             "selected roles.",
+            dismiss_original=True,
         )
         if self.message:
             await self.message.delete()
