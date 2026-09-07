@@ -20,6 +20,8 @@ and private channels without manually editing permission overwrites.
   channel, and role to mention.
 - `/create_access` - Open a GUI that creates a role with a selected color and
   Discord permissions.
+- `/edit_role` - Edit an existing role's Discord permissions and the channels it
+  can access.
 - `/create_channel` - Open a GUI to choose a category, select roles, and create a
   private text channel with the appropriate permission overwrites.
 - `/delete_role` - Delete a selected server role.

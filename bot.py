@@ -680,6 +680,262 @@ class RoleSetupView(discord.ui.View):
             await self.message.edit(view=self)
 
 
+class RoleEditPermissionSelect(discord.ui.Select):
+    def __init__(self, edit_view: RoleEditView) -> None:
+        self.edit_view = edit_view
+        super().__init__(
+            placeholder="Choose permissions",
+            min_values=0,
+            max_values=len(edit_view.permission_pages[edit_view.permission_page]),
+            options=self.build_options(),
+            row=0,
+        )
+
+    def build_options(self) -> list[discord.SelectOption]:
+        page_permissions = self.edit_view.permission_pages[self.edit_view.permission_page]
+        return [
+            discord.SelectOption(
+                label=permission.replace("_", " ").title(),
+                value=permission,
+                default=permission in self.edit_view.selected_permissions,
+            )
+            for permission in page_permissions
+        ]
+
+    def refresh_options(self) -> None:
+        self.options = self.build_options()
+        self.max_values = len(
+            self.edit_view.permission_pages[self.edit_view.permission_page]
+        )
+        self.placeholder = (
+            f"Permissions (page {self.edit_view.permission_page + 1}/"
+            f"{len(self.edit_view.permission_pages)})"
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        page_permissions = set(
+            self.edit_view.permission_pages[self.edit_view.permission_page]
+        )
+        self.edit_view.selected_permissions.difference_update(page_permissions)
+        self.edit_view.selected_permissions.update(self.values)
+        self.edit_view.refresh_controls()
+        await interaction.response.edit_message(view=self.edit_view)
+
+
+class RoleEditChannelSelect(discord.ui.Select):
+    def __init__(self, edit_view: RoleEditView) -> None:
+        self.edit_view = edit_view
+        super().__init__(
+            placeholder="Choose channels the role can access",
+            min_values=0,
+            max_values=len(edit_view.channel_pages[edit_view.channel_page]),
+            options=self.build_options(),
+            row=1,
+        )
+
+    def build_options(self) -> list[discord.SelectOption]:
+        page_channels = self.edit_view.channel_pages[self.edit_view.channel_page]
+        return [
+            discord.SelectOption(
+                label=channel.name[:100],
+                value=str(channel.id),
+                default=channel.id in self.edit_view.selected_channel_ids,
+            )
+            for channel in page_channels
+        ]
+
+    def refresh_options(self) -> None:
+        self.options = self.build_options()
+        self.max_values = len(
+            self.edit_view.channel_pages[self.edit_view.channel_page]
+        )
+        self.placeholder = (
+            f"Channels (page {self.edit_view.channel_page + 1}/"
+            f"{len(self.edit_view.channel_pages)})"
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        page_channel_ids = {
+            channel.id
+            for channel in self.edit_view.channel_pages[self.edit_view.channel_page]
+        }
+        self.edit_view.selected_channel_ids.difference_update(page_channel_ids)
+        self.edit_view.selected_channel_ids.update(int(value) for value in self.values)
+        self.edit_view.refresh_controls()
+        await interaction.response.edit_message(view=self.edit_view)
+
+
+class RoleEditView(discord.ui.View):
+    def __init__(
+        self,
+        owner_id: int,
+        role: discord.Role,
+        channels: list[discord.abc.GuildChannel],
+    ) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.role = role
+        self.selected_permissions = {
+            permission
+            for permission in discord.Permissions.VALID_FLAGS
+            if getattr(role.permissions, permission)
+        }
+        self.selected_channel_ids = {
+            channel.id
+            for channel in channels
+            if channel.permissions_for(role).view_channel
+        }
+        permissions = sorted(discord.Permissions.VALID_FLAGS)
+        self.permission_pages = [
+            permissions[index : index + 25]
+            for index in range(0, len(permissions), 25)
+        ]
+        self.channel_pages = [
+            channels[index : index + 25] for index in range(0, len(channels), 25)
+        ] or [[]]
+        self.permission_page = 0
+        self.channel_page = 0
+        self.permission_select = RoleEditPermissionSelect(self)
+        self.channel_select = RoleEditChannelSelect(self)
+        self.add_item(self.permission_select)
+        self.add_item(self.channel_select)
+        self.message: discord.WebhookMessage | None = None
+        self.refresh_controls()
+
+    def refresh_controls(self) -> None:
+        self.permission_select.refresh_options()
+        self.channel_select.refresh_options()
+        self.previous_permission_page.disabled = self.permission_page == 0
+        self.next_permission_page.disabled = (
+            self.permission_page == len(self.permission_pages) - 1
+        )
+        self.previous_channel_page.disabled = self.channel_page == 0
+        self.next_channel_page.disabled = self.channel_page == len(self.channel_pages) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "Only the person who opened this editor can use it.", ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(
+        label="Previous permissions", style=discord.ButtonStyle.secondary, row=2
+    )
+    async def previous_permission_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.permission_page -= 1
+        self.refresh_controls()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(
+        label="Next permissions", style=discord.ButtonStyle.secondary, row=2
+    )
+    async def next_permission_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.permission_page += 1
+        self.refresh_controls()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(
+        label="Previous channels", style=discord.ButtonStyle.secondary, row=3
+    )
+    async def previous_channel_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.channel_page -= 1
+        self.refresh_controls()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(
+        label="Next channels", style=discord.ButtonStyle.secondary, row=3
+    )
+    async def next_channel_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.channel_page += 1
+        self.refresh_controls()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Save changes", style=discord.ButtonStyle.success, row=4)
+    async def save(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        guild = interaction.guild
+        member = guild.me if guild else None
+        if guild is None or member is None:
+            await interaction.response.send_message(
+                "This editor can only be used in a server.", ephemeral=True
+            )
+            return
+        if not member.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "I need the **Manage Roles** permission.", ephemeral=True
+            )
+            return
+        if not member.guild_permissions.manage_channels:
+            await interaction.response.send_message(
+                "I need the **Manage Channels** permission.", ephemeral=True
+            )
+            return
+        if self.role == guild.default_role or self.role >= member.top_role:
+            await interaction.response.send_message(
+                "I can only edit roles below my highest role.", ephemeral=True
+            )
+            return
+
+        channels = [channel for page in self.channel_pages for channel in page]
+        selected_channels = set(self.selected_channel_ids)
+        permissions = discord.Permissions(
+            **{
+                permission: permission in self.selected_permissions
+                for permission in discord.Permissions.VALID_FLAGS
+            }
+        )
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self.role.edit(
+                permissions=permissions,
+                reason=f"Role edited by {interaction.user}",
+            )
+            for channel in channels:
+                overwrite = channel.overwrites_for(self.role)
+                allowed = channel.id in selected_channels
+                overwrite.view_channel = allowed
+                overwrite.read_message_history = allowed
+                overwrite.send_messages = allowed
+                await channel.set_permissions(
+                    self.role,
+                    overwrite=overwrite,
+                    reason=f"Role channel access edited by {interaction.user}",
+                )
+        except discord.HTTPException:
+            LOGGER.exception("Failed to edit role %s in guild %s", self.role.id, guild.id)
+            await interaction.followup.send(
+                "Discord rejected the role or channel permission update. "
+                "Check my role position and permissions.",
+                ephemeral=True,
+            )
+            return
+
+        self.disable_all_items()
+        await interaction.followup.send(
+            f"Updated {self.role.mention} permissions and access for "
+            f"{len(selected_channels)} channel(s).",
+            ephemeral=True,
+        )
+        if self.message:
+            await self.message.edit(view=self)
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message:
+            await self.message.edit(view=self)
+
+
 class ChannelSetupModal(discord.ui.Modal, title="Create private channel"):
     channel_name = discord.ui.TextInput(
         label="Channel name",
@@ -1045,6 +1301,68 @@ def register_commands(bot: ZodiacBot) -> None:
         await interaction.response.send_modal(
             AccessSetupModal(interaction.user.id, bot)
         )
+
+    @bot.tree.command(
+        name="edit_role",
+        description="Edit an existing role's permissions and channel access.",
+    )
+    @app_commands.describe(role="Role to edit")
+    @administrator_only()
+    @app_commands.guild_only()
+    async def edit_role(interaction: discord.Interaction, role: discord.Role) -> None:
+        guild = interaction.guild
+        member = guild.me if guild else None
+        if guild is None or member is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if role == guild.default_role:
+            await interaction.response.send_message(
+                "The @everyone role cannot be edited.", ephemeral=True
+            )
+            return
+        if not member.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "I need the **Manage Roles** permission.", ephemeral=True
+            )
+            return
+        if not member.guild_permissions.manage_channels:
+            await interaction.response.send_message(
+                "I need the **Manage Channels** permission.", ephemeral=True
+            )
+            return
+        if role >= member.top_role:
+            await interaction.response.send_message(
+                "I can only edit roles below my highest role.", ephemeral=True
+            )
+            return
+
+        channels = sorted(
+            (
+                channel
+                for channel in guild.channels
+                if isinstance(
+                    channel,
+                    (
+                        discord.CategoryChannel,
+                        discord.TextChannel,
+                        discord.VoiceChannel,
+                        discord.StageChannel,
+                        discord.ForumChannel,
+                    ),
+                )
+            ),
+            key=lambda channel: (channel.category_id or 0, channel.position, channel.name),
+        )
+        view = RoleEditView(interaction.user.id, role, channels)
+        await interaction.response.send_message(
+            f"Edit **{role.name}**. Select its permissions and the channels it should "
+            "be able to access, then click **Save changes**.",
+            view=view,
+            ephemeral=True,
+        )
+        view.message = await interaction.original_response()
 
     @bot.tree.command(
         name="create_channel",
