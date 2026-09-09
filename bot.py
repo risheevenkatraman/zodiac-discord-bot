@@ -690,7 +690,6 @@ class RoleSetupView(discord.ui.View):
                 colour=self.color,
                 reason=f"Access setup by {interaction.user}",
             )
-            role = await guild.fetch_role(role.id)
         except discord.HTTPException:
             LOGGER.exception("Failed to create role in guild %s", guild.id)
             await interaction.followup.send(
@@ -948,7 +947,6 @@ class RoleEditView(discord.ui.View):
                     overwrite=overwrite,
                     reason=f"Role channel access edited by {interaction.user}",
                 )
-            self.role = await guild.fetch_role(self.role.id)
         except discord.HTTPException:
             LOGGER.exception("Failed to edit role %s in guild %s", self.role.id, guild.id)
             await interaction.followup.send(
@@ -1195,21 +1193,6 @@ class ChannelSetupView(discord.ui.View):
                 overwrites=overwrites,
                 reason=f"Channel setup by {interaction.user}",
             )
-            fetched_channel = await guild.fetch_channel(channel.id)
-            if not isinstance(fetched_channel, discord.TextChannel):
-                LOGGER.error(
-                    "Created channel %s was returned as %s",
-                    channel.id,
-                    type(fetched_channel).__name__,
-                )
-                await interaction.followup.send(
-                    "The channel was created, but Discord returned an unexpected "
-                    "channel type while confirming it.",
-                    ephemeral=True,
-                )
-                await interaction.delete_original_response()
-                return
-            channel = fetched_channel
         except discord.HTTPException:
             LOGGER.exception("Failed to create channel in guild %s", guild.id)
             await interaction.followup.send(
