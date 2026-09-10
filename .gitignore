@@ -4,3 +4,5 @@ zodiac.db
 __pycache__/
 .pytest_cache/
 *.pyc
+*cookies*.txt
+spotify-token.env

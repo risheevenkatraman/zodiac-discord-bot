@@ -49,6 +49,12 @@ class Database:
             raise RuntimeError("Database is not initialized")
         return self.connection
 
+    async def close(self) -> None:
+        async with self.lock:
+            if self.connection is not None:
+                self.connection.close()
+                self.connection = None
+
     async def set_channel(self, guild_id: int, kind: str, channel_id: int) -> None:
         async with self.lock:
             connection = self._require_connection()
@@ -112,12 +118,18 @@ class Database:
                     "SELECT guild_id, username FROM twitch_live_notifications"
                 ).fetchall()
             }
-            connection.execute("DELETE FROM twitch_live_notifications")
-            connection.executemany(
-                "INSERT INTO twitch_live_notifications (guild_id, username) VALUES (?, ?)",
-                sorted(live_accounts),
-            )
-            connection.commit()
+            added = live_accounts - existing
+            removed = existing - live_accounts
+            if added or removed:
+                with connection:
+                    connection.executemany(
+                        "DELETE FROM twitch_live_notifications WHERE guild_id = ? AND username = ?",
+                        sorted(removed),
+                    )
+                    connection.executemany(
+                        "INSERT INTO twitch_live_notifications (guild_id, username) VALUES (?, ?)",
+                        sorted(added),
+                    )
             return live_accounts - existing
 
     async def remove_twitch_live_account(self, guild_id: int, username: str) -> None:

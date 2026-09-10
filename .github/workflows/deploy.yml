@@ -3,13 +3,32 @@ name: Deploy bot
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
   deploy:
+    needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -37,6 +56,8 @@ jobs:
             --exclude=.github \
             --exclude=.venv \
             --exclude=.env \
+            --exclude='*cookies*.txt' \
+            --exclude=spotify-token.env \
             --exclude=zodiac.db \
             -czf - . | ssh "$AWS_USER@$AWS_HOST" \
             "sudo mkdir -p /opt/zodiac-discord-bot && sudo tar -xzf - -C /opt/zodiac-discord-bot"
@@ -49,7 +70,7 @@ jobs:
           ssh "$AWS_USER@$AWS_HOST" \
             "sudo python3 -m venv /opt/zodiac-discord-bot/.venv && \
              sudo /opt/zodiac-discord-bot/.venv/bin/pip install --upgrade pip && \
-             sudo /opt/zodiac-discord-bot/.venv/bin/pip install -r /opt/zodiac-discord-bot/requirements.txt && \
+             sudo /opt/zodiac-discord-bot/.venv/bin/pip install --upgrade -r /opt/zodiac-discord-bot/requirements.txt && \
              sudo install -m 0644 /opt/zodiac-discord-bot/deploy/zodiac-bot.service /etc/systemd/system/zodiac-bot.service && \
              sudo chown -R ubuntu:ubuntu /opt/zodiac-discord-bot && \
              sudo systemctl daemon-reload && \

@@ -4,25 +4,30 @@ import asyncio
 import base64
 import logging
 import os
+import re
 import secrets
-from dataclasses import dataclass
+import time
+from contextlib import suppress
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
 import discord
-import yt_dlp
 from aiohttp import web
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from database import Database
+from media import MediaError, extract_info, extraction_options
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("zodiac-bot")
+PERMISSION_NAMES = tuple(sorted(name for name, _ in discord.Permissions.none()))
+MAX_QUEUE_SIZE = 200
 
 
 def required_env(name: str) -> str:
@@ -44,6 +49,9 @@ class Settings:
     spotify_client_id: str | None
     spotify_client_secret: str | None
     ffmpeg_path: str
+    ytdlp_cookies_file: str | None = None
+    ytdlp_js_runtime: str | None = None
+    spotify_refresh_token: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -53,6 +61,8 @@ class Settings:
             raise RuntimeError(
                 "TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET must be configured together"
             )
+        if bool(os.getenv("SPOTIFY_CLIENT_ID")) != bool(os.getenv("SPOTIFY_CLIENT_SECRET")):
+            raise RuntimeError("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be configured together")
         return cls(
             discord_token=required_env("DISCORD_TOKEN"),
             webhook_secret=required_env("WEBHOOK_SECRET"),
@@ -64,6 +74,9 @@ class Settings:
             spotify_client_id=os.getenv("SPOTIFY_CLIENT_ID"),
             spotify_client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
             ffmpeg_path=os.getenv("FFMPEG_PATH", "ffmpeg"),
+            ytdlp_cookies_file=os.getenv("YTDLP_COOKIES_FILE") or None,
+            ytdlp_js_runtime=os.getenv("YTDLP_JS_RUNTIME") or None,
+            spotify_refresh_token=os.getenv("SPOTIFY_REFRESH_TOKEN") or None,
         )
 
 
@@ -71,6 +84,7 @@ class Settings:
 class MusicTrack:
     source: str
     title: str
+    notification_channel_id: int | None = None
 
 
 class GuildMusicPlayer:
@@ -80,11 +94,14 @@ class GuildMusicPlayer:
         self.queue: asyncio.Queue[MusicTrack] = asyncio.Queue()
         self.voice_client: discord.VoiceClient | None = None
         self.current: MusicTrack | None = None
+        self.connection_lock = asyncio.Lock()
         self.player_task = asyncio.create_task(self._run())
 
     async def enqueue(self, tracks: list[MusicTrack]) -> None:
+        if self.queue.qsize() + len(tracks) > MAX_QUEUE_SIZE:
+            raise ValueError(f"The queue can hold at most {MAX_QUEUE_SIZE} upcoming tracks.")
         for track in tracks:
-            await self.queue.put(track)
+            self.queue.put_nowait(track)
 
     async def _run(self) -> None:
         while True:
@@ -92,8 +109,16 @@ class GuildMusicPlayer:
             self.current = track
             try:
                 await self._play(track)
-            except (discord.ClientException, discord.HTTPException, OSError):
+            except (discord.ClientException, discord.HTTPException, OSError, RuntimeError) as error:
                 LOGGER.exception("Failed to play track in guild %s", self.guild_id)
+                channel = self.bot.get_channel(track.notification_channel_id) if track.notification_channel_id else None
+                if channel is not None:
+                    detail = str(error) if isinstance(error, MediaError) else "Check FFmpeg, voice permissions, and the bot logs."
+                    with suppress(discord.HTTPException):
+                        await channel.send(
+                            f"Could not play **{discord.utils.escape_markdown(track.title[:100])}**. {detail}",
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
             finally:
                 self.current = None
                 self.queue.task_done()
@@ -107,11 +132,16 @@ class GuildMusicPlayer:
             raise RuntimeError(f"No playable audio was found for {track.title}")
         finished = asyncio.get_running_loop().create_future()
 
-        def after(error: Exception | None) -> None:
+        def finish(error: Exception | None) -> None:
+            if finished.done():
+                return
             if error:
-                self.bot.loop.call_soon_threadsafe(finished.set_exception, error)
+                finished.set_exception(error)
             else:
-                self.bot.loop.call_soon_threadsafe(finished.set_result, None)
+                finished.set_result(None)
+
+        def after(error: Exception | None) -> None:
+            self.bot.loop.call_soon_threadsafe(finish, error)
 
         source = discord.FFmpegPCMAudio(
             stream_url,
@@ -119,25 +149,32 @@ class GuildMusicPlayer:
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
             options="-vn",
         )
-        self.voice_client.play(source, after=after)
+        try:
+            self.voice_client.play(source, after=after)
+        except Exception:
+            source.cleanup()
+            raise
         await finished
 
     async def stop(self) -> None:
+        self.player_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self.player_task
         while not self.queue.empty():
             self.queue.get_nowait()
             self.queue.task_done()
-        if self.voice_client and self.voice_client.is_playing():
+        if self.voice_client:
             self.voice_client.stop()
         if self.voice_client and self.voice_client.is_connected():
             await self.voice_client.disconnect()
-        self.player_task.cancel()
 
 
 class ZodiacBot(commands.Bot):
     def __init__(self, settings: Settings, database: Database) -> None:
         intents = discord.Intents.default()
         intents.members = True
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="!", intents=intents,
+                         allowed_mentions=discord.AllowedMentions.none())
         self.settings = settings
         self.database = database
         self.http_session: aiohttp.ClientSession | None = None
@@ -145,10 +182,14 @@ class ZodiacBot(commands.Bot):
         self.webhook_runner: web.AppRunner | None = None
         self.music_players: dict[int, GuildMusicPlayer] = {}
         self.spotify_token: str | None = None
+        self.spotify_token_expires_at = 0.0
+        self.spotify_refresh_token = settings.spotify_refresh_token
+        self.media_lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
-        self.http_session = aiohttp.ClientSession()
+        self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         await self.tree.sync()
+        self.twitch_poll_loop.change_interval(seconds=self.settings.twitch_poll_seconds)
         self.twitch_poll_loop.start()
 
     async def close(self) -> None:
@@ -161,6 +202,7 @@ class ZodiacBot(commands.Bot):
             await player.stop()
         self.music_players.clear()
         await super().close()
+        await self.database.close()
 
     def music_player(self, guild_id: int) -> GuildMusicPlayer:
         player = self.music_players.get(guild_id)
@@ -171,19 +213,12 @@ class ZodiacBot(commands.Bot):
 
     async def extract_audio(self, source: str) -> dict[str, Any]:
         options = {
+            **extraction_options(self.settings),
             "format": "bestaudio/best",
             "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
         }
-        try:
-            result = await asyncio.to_thread(
-                lambda: yt_dlp.YoutubeDL(options).extract_info(source, download=False)
-            )
-        except yt_dlp.utils.DownloadError as error:
-            raise RuntimeError("The media URL could not be played.") from error
-        if not isinstance(result, dict):
-            raise RuntimeError("The media extractor returned no track information")
+        async with self.media_lock:
+            result = await asyncio.to_thread(extract_info, source, options)
         if result.get("entries"):
             first = next((entry for entry in result["entries"] if isinstance(entry, dict)), None)
             if first is None:
@@ -195,20 +230,19 @@ class ZodiacBot(commands.Bot):
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             raise ValueError("Please provide a valid YouTube or Spotify URL.")
-        if parsed.netloc.lower().endswith("spotify.com"):
+        hostname = (parsed.hostname or "").lower()
+        if hostname == "open.spotify.com":
             return await self.resolve_spotify(url)
+        if hostname not in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}:
+            raise ValueError("Please provide a valid YouTube or Spotify URL.")
         options = {
+            **extraction_options(self.settings),
             "extract_flat": True,
-            "quiet": True,
-            "no_warnings": True,
             "skip_download": True,
+            "playlistend": MAX_QUEUE_SIZE + 1,
         }
-        try:
-            result = await asyncio.to_thread(
-                lambda: yt_dlp.YoutubeDL(options).extract_info(url, download=False)
-            )
-        except yt_dlp.utils.DownloadError as error:
-            raise ValueError("The media URL could not be read.") from error
+        async with self.media_lock:
+            result = await asyncio.to_thread(extract_info, url, options)
         if not isinstance(result, dict):
             raise RuntimeError("No media was found at that URL.")
         entries = result.get("entries")
@@ -227,7 +261,7 @@ class ZodiacBot(commands.Bot):
         return [MusicTrack(source=str(webpage_url), title=str(result.get("title") or url))]
 
     async def spotify_access_token(self) -> str:
-        if self.spotify_token:
+        if self.spotify_token and time.monotonic() < self.spotify_token_expires_at:
             return self.spotify_token
         if not self.http_session or not self.settings.spotify_client_id or not self.settings.spotify_client_secret:
             raise RuntimeError("Spotify links require SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET.")
@@ -237,52 +271,83 @@ class ZodiacBot(commands.Bot):
         async with self.http_session.post(
             "https://accounts.spotify.com/api/token",
             headers={"Authorization": f"Basic {credentials}"},
-            data={"grant_type": "client_credentials"},
+            data=({"grant_type": "refresh_token", "refresh_token": self.spotify_refresh_token}
+                  if self.spotify_refresh_token else {"grant_type": "client_credentials"}),
         ) as response:
+            if response.status in {400, 401}:
+                raise MediaError("Spotify rejected the credentials. Check the client ID, secret, and any configured refresh token on the host.")
             response.raise_for_status()
             payload = await response.json()
         token = payload.get("access_token")
         if not isinstance(token, str):
             raise RuntimeError("Spotify did not return an access token.")
         self.spotify_token = token
+        if isinstance(payload.get("refresh_token"), str):
+            self.spotify_refresh_token = payload["refresh_token"]
+        self.spotify_token_expires_at = time.monotonic() + max(0, float(payload.get("expires_in", 3600)) - 60)
         return token
+
+    async def spotify_get(self, endpoint: str) -> dict[str, Any]:
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "https" or parsed.netloc != "api.spotify.com":
+            raise MediaError("Spotify returned an invalid pagination URL.")
+        for attempt in range(2):
+            token = await self.spotify_access_token()
+            assert self.http_session is not None
+            async with self.http_session.get(endpoint, headers={"Authorization": f"Bearer {token}"}) as response:
+                if response.status == 401:
+                    self.spotify_token = None
+                    if attempt == 0:
+                        continue
+                    raise MediaError("Spotify authorization failed after refreshing. Check the app credentials.")
+                if response.status == 403:
+                    raise MediaError("Spotify denied access. Check the app's Development Mode/Premium requirements and the authorized user's playlist access.")
+                if response.status == 404:
+                    raise MediaError("Spotify could not access that track or playlist. Check the link and the authorized user's access.")
+                if response.status == 429:
+                    raise MediaError("Spotify is rate limiting requests. Wait before trying again.")
+                response.raise_for_status()
+                return await response.json()
+        raise MediaError("Spotify authorization failed.")
 
     async def resolve_spotify(self, url: str) -> list[MusicTrack]:
         parsed = urlparse(url)
         parts = [part for part in parsed.path.split("/") if part]
         if parts and parts[0].startswith("intl-"):
             parts = parts[1:]
-        if len(parts) < 2 or parts[0] not in {"track", "playlist"}:
+        if len(parts) != 2 or parts[0] not in {"track", "playlist"} or not re.fullmatch(r"[A-Za-z0-9]{22}", parts[1]):
             raise ValueError("Only Spotify song and playlist links are supported.")
-        token = await self.spotify_access_token()
-        headers = {"Authorization": f"Bearer {token}"}
         endpoint = f"https://api.spotify.com/v1/{parts[0]}s/{parts[1]}"
-        assert self.http_session is not None
-        async with self.http_session.get(endpoint, headers=headers) as response:
-            if response.status == 401:
-                self.spotify_token = None
-                raise RuntimeError("Spotify authorization expired; please try again.")
-            response.raise_for_status()
-            payload = await response.json()
+        payload = await self.spotify_get(endpoint)
         if parts[0] == "track":
             items = [payload]
         else:
-            items = payload.get("tracks", {}).get("items", [])
-            next_url = payload.get("tracks", {}).get("next")
+            page = payload.get("items", payload.get("tracks"))
+            if not isinstance(page, dict):
+                raise MediaError("Spotify returned playlist metadata without its songs. This playlist requires authorized user access; configure SPOTIFY_REFRESH_TOKEN for an eligible owner/collaborator, or use a track link.")
+            items = list(page.get("items", []))
+            next_url = page.get("next")
+            visited = set()
             while isinstance(next_url, str):
-                async with self.http_session.get(next_url, headers=headers) as response:
-                    response.raise_for_status()
-                    page = await response.json()
+                if len(items) > MAX_QUEUE_SIZE:
+                    raise ValueError(f"Please choose a playlist with at most {MAX_QUEUE_SIZE} tracks.")
+                if next_url in visited:
+                    raise MediaError("Spotify repeated a playlist page. Try again later.")
+                visited.add(next_url)
+                page = await self.spotify_get(next_url)
                 items.extend(page.get("items", []))
                 next_url = page.get("next")
         tracks: list[MusicTrack] = []
         for item in items:
             if parts[0] == "playlist" and isinstance(item, dict):
-                item = item.get("track", item)
+                item = item.get("item", item.get("track", item))
             if not isinstance(item, dict) or not item.get("name"):
                 continue
+            if item.get("is_local") or item.get("type", "track") != "track":
+                continue
             artists = ", ".join(
-                artist["name"] for artist in item.get("artists", []) if isinstance(artist, dict)
+                artist["name"] for artist in item.get("artists", [])
+                if isinstance(artist, dict) and isinstance(artist.get("name"), str)
             )
             query = f"ytsearch1:{artists} - {item['name']}"
             tracks.append(MusicTrack(source=query, title=f"{artists} - {item['name']}"))
@@ -297,20 +362,24 @@ class ZodiacBot(commands.Bot):
 
     async def post_to_configured_channel(
         self, guild_id: int, content: str, *, kind: str, role_id: int | None = None
-    ) -> None:
+    ) -> bool:
         channel_id = await self.database.get_channel(guild_id, kind)
         if not channel_id:
             LOGGER.warning("No configured channel for guild %s", guild_id)
-            return
+            return False
         channel = self.get_channel(channel_id)
         if not isinstance(channel, discord.TextChannel):
             LOGGER.warning("Configured channel %s is unavailable", channel_id)
-            return
+            return False
         mention = f"<@&{role_id}> " if role_id else ""
         await channel.send(
             f"{mention}{content}",
-            allowed_mentions=discord.AllowedMentions(roles=bool(role_id)),
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, users=False, replied_user=False,
+                roles=[discord.Object(id=role_id)] if role_id else False,
+            ),
         )
+        return True
 
     async def get_twitch_token(self) -> str:
         if self.twitch_token:
@@ -335,6 +404,12 @@ class ZodiacBot(commands.Bot):
 
     @tasks.loop(seconds=60)
     async def twitch_poll_loop(self) -> None:
+        try:
+            await self.poll_twitch()
+        except (aiohttp.ClientError, TimeoutError, RuntimeError):
+            LOGGER.exception("Twitch poll failed; will retry on the next interval")
+
+    async def poll_twitch(self) -> None:
         if (
             not self.settings.twitch_client_id
             or not self.settings.twitch_client_secret
@@ -349,45 +424,45 @@ class ZodiacBot(commands.Bot):
             "Client-ID": self.settings.twitch_client_id,
             "Authorization": f"Bearer {token}",
         }
-        async with self.http_session.get(
-            "https://api.twitch.tv/helix/streams",
-            params=[("user_login", account["username"]) for account in accounts],
-            headers=headers,
-        ) as response:
-            if response.status == 401:
-                self.twitch_token = None
-                return
-            response.raise_for_status()
-            streams: list[dict[str, Any]] = (await response.json()).get("data", [])
-        account_map = {account["username"].casefold(): account for account in accounts}
-        currently_live: set[tuple[int, str]] = set()
-        for stream in streams:
-            username = stream["user_login"].casefold()
-            account = account_map.get(username)
-            if not account:
-                continue
-            key = (account["guild_id"], username)
-            currently_live.add(key)
+        usernames = sorted({account["username"].casefold() for account in accounts})
+        streams: dict[str, dict[str, Any]] = {}
+        for index in range(0, len(usernames), 100):
+            async with self.http_session.get(
+                "https://api.twitch.tv/helix/streams",
+                params=[("first", "100")] + [
+                    ("user_login", username) for username in usernames[index:index + 100]
+                ],
+                headers=headers,
+            ) as response:
+                if response.status == 401:
+                    self.twitch_token = None
+                    return
+                response.raise_for_status()
+                streams.update({
+                    stream["user_login"].casefold(): stream
+                    for stream in (await response.json()).get("data", [])
+                })
+        # Only update notification state after every request has succeeded.
+        currently_live = {
+            (account["guild_id"], account["username"].casefold())
+            for account in accounts if account["username"].casefold() in streams
+        }
         new_live_accounts = await self.database.sync_twitch_live_accounts(currently_live)
-        for stream in streams:
-            username = stream["user_login"].casefold()
-            account = account_map.get(username)
-            if not account:
-                continue
-            key = (account["guild_id"], username)
-            if key not in new_live_accounts:
-                continue
-            role_id = await self.database.get_role(account["guild_id"], "social")
+        for guild_id, username in sorted(new_live_accounts):
+            stream = streams[username]
+            role_id = await self.database.get_role(guild_id, "social")
             try:
-                await self.post_to_configured_channel(
-                    account["guild_id"],
+                posted = await self.post_to_configured_channel(
+                    guild_id,
                     f"**{stream['user_name']} is live:** https://twitch.tv/{stream['user_login']}",
                     kind="twitch",
                     role_id=role_id,
                 )
+                if not posted:
+                    await self.database.remove_twitch_live_account(guild_id, username)
             except (discord.HTTPException, RuntimeError):
-                await self.database.remove_twitch_live_account(*key)
-                raise
+                await self.database.remove_twitch_live_account(guild_id, username)
+                LOGGER.exception("Could not post Twitch notification to guild %s", guild_id)
 
     @twitch_poll_loop.before_loop
     async def before_twitch_poll_loop(self) -> None:
@@ -396,10 +471,37 @@ class ZodiacBot(commands.Bot):
 
 def administrator_only() -> Any:
     def decorator(command: Any) -> Any:
+        command = app_commands.guild_only()(command)
         command = app_commands.default_permissions(administrator=True)(command)
         return app_commands.checks.has_permissions(administrator=True)(command)
 
     return decorator
+
+
+async def send_error(interaction: discord.Interaction, message: str) -> None:
+    """Resolve pending responses without deleting the error the user needs to see."""
+    if interaction.response.type == discord.InteractionResponseType.deferred_channel_message:
+        await interaction.edit_original_response(content=message, view=None)
+    elif interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+async def check_music_channel(interaction: discord.Interaction) -> bool:
+    voice_client = interaction.guild.voice_client if interaction.guild else None
+    voice = getattr(interaction.user, "voice", None)
+    if voice_client and (not voice or voice.channel != voice_client.channel):
+        await send_error(interaction, "Join my voice channel to control playback.")
+        return False
+    return True
+
+
+def normalize_twitch_username(value: str) -> str:
+    username = value.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]{1,25}", username):
+        raise ValueError("Enter a Twitch login name (letters, numbers, underscores), not a URL.")
+    return username
 
 
 async def publish_confirmation(
@@ -409,11 +511,16 @@ async def publish_confirmation(
     dismiss_original: bool = False,
 ) -> None:
     """Post a successful command result publicly and dismiss private command UI."""
+    already_responded = interaction.response.is_done()
+    if interaction.response.type == discord.InteractionResponseType.deferred_channel_message:
+        # Resolve the deferred response first: the first followup would otherwise
+        # inherit its visibility, even when ephemeral=False is requested.
+        await interaction.edit_original_response(content=message, view=None)
     if interaction.response.is_done():
         await interaction.followup.send(message, ephemeral=False, wait=True)
     else:
         await interaction.response.send_message(message)
-    if dismiss_original and interaction.response.is_done():
+    if dismiss_original and already_responded:
         try:
             await interaction.delete_original_response()
         except discord.NotFound:
@@ -449,7 +556,13 @@ def parse_role_color(value: str) -> discord.Colour:
         ) from error
 
 
-class AccessSetupModal(discord.ui.Modal, title="Create role"):
+class SetupModal(discord.ui.Modal):
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        LOGGER.error("Setup modal failed", exc_info=(type(error), error, error.__traceback__))
+        await send_error(interaction, "The setup could not open. Please run the command again.")
+
+
+class AccessSetupModal(SetupModal, title="Create role"):
     role_name = discord.ui.TextInput(
         label="Role name",
         placeholder="e.g. Event Staff",
@@ -537,7 +650,45 @@ class PermissionSelect(discord.ui.Select):
         await interaction.response.edit_message(view=self.setup_view)
 
 
-class PermissionSetupView(discord.ui.View):
+class SetupView(discord.ui.View):
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=4)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.disable_all_items()
+        await interaction.response.edit_message(content="Setup cancelled.", view=None)
+
+    async def begin_operation(self, interaction: discord.Interaction) -> bool:
+        if not interaction.permissions.administrator:
+            await send_error(interaction, "You need Administrator permission to submit this setup.")
+            return False
+        if self.is_finished():
+            await send_error(interaction, "This setup has already been submitted. Start a new command to try again.")
+            return False
+        self.disable_all_items()
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        if self.message:
+            with suppress(discord.NotFound):
+                await self.message.delete()
+            self.message = None
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        LOGGER.error("Setup failed", exc_info=(type(error), error, error.__traceback__))
+        await send_error(interaction, "The setup could not finish. Check the current roles/channels before trying again.")
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message:
+            with suppress(discord.HTTPException):
+                await self.message.edit(content="This setup expired. Run the command again to continue.", view=self)
+
+    def disable_all_items(self) -> None:
+        for item in self.children:
+            if isinstance(item, (discord.ui.Button, discord.ui.Select, discord.ui.ChannelSelect)):
+                item.disabled = True
+        self.stop()
+
+
+class PermissionSetupView(SetupView):
     def __init__(
         self,
         owner_id: int,
@@ -552,7 +703,7 @@ class PermissionSetupView(discord.ui.View):
         self.color = color
         self.selected_permissions: set[str] = set()
         self.message: discord.WebhookMessage | None = None
-        permissions = sorted(discord.Permissions.VALID_FLAGS)
+        permissions = list(PERMISSION_NAMES)
         self.permission_pages = [
             permissions[index : index + 25]
             for index in range(0, len(permissions), 25)
@@ -621,14 +772,10 @@ class PermissionSetupView(discord.ui.View):
             view=view,
         )
         view.message = await interaction.original_response()
-
-    async def on_timeout(self) -> None:
-        self.disable_all_items()
-        if self.message:
-            await self.message.edit(view=self)
+        self.stop()
 
 
-class RoleSetupView(discord.ui.View):
+class RoleSetupView(SetupView):
     def __init__(
         self,
         owner_id: int,
@@ -679,10 +826,8 @@ class RoleSetupView(discord.ui.View):
             )
             return
 
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        if self.message:
-            await self.message.delete()
-            self.message = None
+        if not await self.begin_operation(interaction):
+            return
         try:
             role = await guild.create_role(
                 name=self.role_name,
@@ -692,12 +837,10 @@ class RoleSetupView(discord.ui.View):
             )
         except discord.HTTPException:
             LOGGER.exception("Failed to create role in guild %s", guild.id)
-            await interaction.followup.send(
+            await send_error(interaction,
                 "Discord rejected the role creation. Check my role position and "
                 "permissions, then try again.",
-                ephemeral=True,
             )
-            await interaction.delete_original_response()
             return
 
         self.disable_all_items()
@@ -706,10 +849,6 @@ class RoleSetupView(discord.ui.View):
             f"Created {role.mention} with the requested permissions and color.",
             dismiss_original=True,
         )
-    async def on_timeout(self) -> None:
-        self.disable_all_items()
-        if self.message:
-            await self.message.edit(view=self)
 
 
 class RoleEditPermissionSelect(discord.ui.Select):
@@ -760,7 +899,7 @@ class RoleEditChannelSelect(discord.ui.Select):
         super().__init__(
             placeholder="Choose channels the role can access",
             min_values=0,
-            max_values=len(edit_view.channel_pages[edit_view.channel_page]),
+            max_values=max(1, len(edit_view.channel_pages[edit_view.channel_page])),
             options=self.build_options(),
             row=1,
         )
@@ -774,13 +913,14 @@ class RoleEditChannelSelect(discord.ui.Select):
                 default=channel.id in self.edit_view.selected_channel_ids,
             )
             for channel in page_channels
-        ]
+        ] or [discord.SelectOption(label="No channels available", value="none")]
 
     def refresh_options(self) -> None:
         self.options = self.build_options()
-        self.max_values = len(
+        self.max_values = max(1, len(
             self.edit_view.channel_pages[self.edit_view.channel_page]
-        )
+        ))
+        self.disabled = not self.edit_view.channel_pages[self.edit_view.channel_page]
         self.placeholder = (
             f"Channels (page {self.edit_view.channel_page + 1}/"
             f"{len(self.edit_view.channel_pages)})"
@@ -797,7 +937,7 @@ class RoleEditChannelSelect(discord.ui.Select):
         await interaction.response.edit_message(view=self.edit_view)
 
 
-class RoleEditView(discord.ui.View):
+class RoleEditView(SetupView):
     def __init__(
         self,
         owner_id: int,
@@ -809,7 +949,7 @@ class RoleEditView(discord.ui.View):
         self.role = role
         self.selected_permissions = {
             permission
-            for permission in discord.Permissions.VALID_FLAGS
+            for permission in PERMISSION_NAMES
             if getattr(role.permissions, permission)
         }
         self.selected_channel_ids = {
@@ -817,7 +957,7 @@ class RoleEditView(discord.ui.View):
             for channel in channels
             if channel.permissions_for(role).view_channel
         }
-        permissions = sorted(discord.Permissions.VALID_FLAGS)
+        permissions = list(PERMISSION_NAMES)
         self.permission_pages = [
             permissions[index : index + 25]
             for index in range(0, len(permissions), 25)
@@ -913,7 +1053,7 @@ class RoleEditView(discord.ui.View):
                 "I need the **Manage Channels** permission.", ephemeral=True
             )
             return
-        if self.role == guild.default_role or self.role >= member.top_role:
+        if self.role.managed or self.role == guild.default_role or self.role >= member.top_role:
             await interaction.response.send_message(
                 "I can only edit roles below my highest role.", ephemeral=True
             )
@@ -924,21 +1064,24 @@ class RoleEditView(discord.ui.View):
         permissions = discord.Permissions(
             **{
                 permission: permission in self.selected_permissions
-                for permission in discord.Permissions.VALID_FLAGS
+                for permission in PERMISSION_NAMES
             }
         )
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        if self.message:
-            await self.message.delete()
-            self.message = None
+        if not await self.begin_operation(interaction):
+            return
         try:
-            self.role = await self.role.edit(
-                permissions=permissions,
-                reason=f"Role edited by {interaction.user}",
-            )
+            if self.role.permissions != permissions:
+                self.role = await self.role.edit(
+                    permissions=permissions,
+                    reason=f"Role edited by {interaction.user}",
+                )
             for channel in channels:
                 overwrite = channel.overwrites_for(self.role)
                 allowed = channel.id in selected_channels
+                if all(getattr(overwrite, permission) is allowed for permission in (
+                    "view_channel", "read_message_history", "send_messages"
+                )):
+                    continue
                 overwrite.view_channel = allowed
                 overwrite.read_message_history = allowed
                 overwrite.send_messages = allowed
@@ -949,12 +1092,10 @@ class RoleEditView(discord.ui.View):
                 )
         except discord.HTTPException:
             LOGGER.exception("Failed to edit role %s in guild %s", self.role.id, guild.id)
-            await interaction.followup.send(
+            await send_error(interaction,
                 "Discord rejected the role or channel permission update. "
-                "Check my role position and permissions.",
-                ephemeral=True,
+                "Some changes may already have been applied. Check my role position and permissions.",
             )
-            await interaction.delete_original_response()
             return
 
         self.disable_all_items()
@@ -964,13 +1105,9 @@ class RoleEditView(discord.ui.View):
             f"{len(selected_channels)} channel(s).",
             dismiss_original=True,
         )
-    async def on_timeout(self) -> None:
-        self.disable_all_items()
-        if self.message:
-            await self.message.edit(view=self)
 
 
-class ChannelSetupModal(discord.ui.Modal, title="Create private channel"):
+class ChannelSetupModal(SetupModal, title="Create private channel"):
     channel_name = discord.ui.TextInput(
         label="Channel name",
         placeholder="e.g. event-planning",
@@ -992,7 +1129,7 @@ class ChannelSetupModal(discord.ui.Modal, title="Create private channel"):
             owner_id=self.owner_id,
             bot=self.bot,
             channel_name=str(self.channel_name).strip().lower().replace(" ", "-"),
-            roles=interaction.guild.roles,
+            roles=[role for role in interaction.guild.roles if role != interaction.guild.default_role],
         )
         await interaction.response.send_message(
             "Select a category and the roles that should access the channel, "
@@ -1008,7 +1145,7 @@ class AllRolesSelect(discord.ui.Select):
         self.setup_view = view
         super().__init__(
             placeholder="Choose roles with access",
-            min_values=1,
+            min_values=0,
             max_values=max(1, min(25, len(view.role_pages[view.role_page]))),
             options=self.build_options(),
             row=1,
@@ -1023,11 +1160,12 @@ class AllRolesSelect(discord.ui.Select):
                 default=role.id in self.setup_view.selected_role_ids,
             )
             for role in page_roles
-        ]
+        ] or [discord.SelectOption(label="No roles available", value="none")]
 
     def refresh_options(self) -> None:
         self.options = self.build_options()
         self.max_values = max(1, min(25, len(self.setup_view.role_pages[self.setup_view.role_page])))
+        self.disabled = not self.setup_view.role_pages[self.setup_view.role_page]
         self.placeholder = (
             f"Choose roles (page {self.setup_view.role_page + 1}/"
             f"{len(self.setup_view.role_pages)})"
@@ -1047,7 +1185,7 @@ class AllRolesSelect(discord.ui.Select):
         await interaction.response.edit_message(view=self.setup_view)
 
 
-class ChannelSetupView(discord.ui.View):
+class ChannelSetupView(SetupView):
     def __init__(
         self,
         owner_id: int,
@@ -1098,9 +1236,7 @@ class ChannelSetupView(discord.ui.View):
         self, interaction: discord.Interaction, select: discord.ui.ChannelSelect
     ) -> None:
         self.category_id = select.values[0].id
-        await interaction.response.send_message(
-            "Category selected.", ephemeral=True
-        )
+        await interaction.response.edit_message(view=self)
 
     @discord.ui.button(
         label="Previous roles", style=discord.ButtonStyle.secondary, row=2
@@ -1172,8 +1308,10 @@ class ChannelSetupView(discord.ui.View):
             )
             return
 
-        overwrites: dict[discord.Role, discord.PermissionOverwrite] = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False)
+        overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                read_message_history=True),
         }
         for role in selected_roles:
             overwrites[role] = discord.PermissionOverwrite(
@@ -1182,10 +1320,8 @@ class ChannelSetupView(discord.ui.View):
                 read_message_history=True,
             )
 
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        if self.message:
-            await self.message.delete()
-            self.message = None
+        if not await self.begin_operation(interaction):
+            return
         try:
             channel = await guild.create_text_channel(
                 self.channel_name,
@@ -1195,12 +1331,10 @@ class ChannelSetupView(discord.ui.View):
             )
         except discord.HTTPException:
             LOGGER.exception("Failed to create channel in guild %s", guild.id)
-            await interaction.followup.send(
+            await send_error(interaction,
                 "Discord rejected the channel creation. Check my channel "
                 "permissions and try again.",
-                ephemeral=True,
             )
-            await interaction.delete_original_response()
             return
 
         self.disable_all_items()
@@ -1210,10 +1344,6 @@ class ChannelSetupView(discord.ui.View):
             "selected roles.",
             dismiss_original=True,
         )
-    async def on_timeout(self) -> None:
-        self.disable_all_items()
-        if self.message:
-            await self.message.edit(view=self)
 
 
 def register_commands(bot: ZodiacBot) -> None:
@@ -1241,22 +1371,28 @@ def register_commands(bot: ZodiacBot) -> None:
                 "I am already playing in another voice channel.", ephemeral=True
             )
             return
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
         try:
             tracks = await bot.resolve_media(url.strip())
+            tracks = [replace(track, notification_channel_id=interaction.channel_id) for track in tracks]
             player = bot.music_player(interaction.guild_id)
-            if voice_client is None:
-                player.voice_client = await channel.connect()
-            else:
-                player.voice_client = voice_client
-            await player.enqueue(tracks)
-        except (ValueError, RuntimeError, discord.ClientException, discord.HTTPException) as error:
+            async with player.connection_lock:
+                if player.player_task.done():
+                    raise ValueError("Playback was stopped while the link loaded. Run /play again.")
+                voice_client = interaction.guild.voice_client
+                if voice_client and voice_client.channel != channel:
+                    raise ValueError("I am already playing in another voice channel.")
+                if player.queue.qsize() + len(tracks) > MAX_QUEUE_SIZE:
+                    raise ValueError(f"The queue can hold at most {MAX_QUEUE_SIZE} upcoming tracks.")
+                player.voice_client = voice_client or await channel.connect()
+                await player.enqueue(tracks)
+        except (ValueError, RuntimeError, discord.ClientException, discord.HTTPException,
+                aiohttp.ClientError, TimeoutError) as error:
             LOGGER.warning("Could not queue media in guild %s: %s", interaction.guild_id, error)
-            await interaction.followup.send(str(error), ephemeral=True)
-            await interaction.delete_original_response()
+            await send_error(interaction, str(error))
             return
         if len(tracks) == 1:
-            message = f"Queued **{tracks[0].title}**."
+            message = f"Queued **{discord.utils.escape_markdown(tracks[0].title[:300])}**."
         else:
             message = f"Queued **{len(tracks)} tracks**."
         await publish_confirmation(interaction, message, dismiss_original=True)
@@ -1264,8 +1400,12 @@ def register_commands(bot: ZodiacBot) -> None:
     @bot.tree.command(name="skip", description="Skip the currently playing track.")
     @app_commands.guild_only()
     async def skip(interaction: discord.Interaction) -> None:
+        if not await check_music_channel(interaction):
+            return
         player = bot.music_players.get(interaction.guild_id)
-        if not player or not player.voice_client or not player.voice_client.is_playing():
+        if not player or not player.voice_client or not (
+            player.voice_client.is_playing() or player.voice_client.is_paused()
+        ):
             await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
             return
         player.voice_client.stop()
@@ -1274,6 +1414,8 @@ def register_commands(bot: ZodiacBot) -> None:
     @bot.tree.command(name="pause", description="Pause the currently playing track.")
     @app_commands.guild_only()
     async def pause(interaction: discord.Interaction) -> None:
+        if not await check_music_channel(interaction):
+            return
         player = bot.music_players.get(interaction.guild_id)
         if not player or not player.voice_client or not player.voice_client.is_playing():
             await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
@@ -1284,6 +1426,8 @@ def register_commands(bot: ZodiacBot) -> None:
     @bot.tree.command(name="resume", description="Resume paused music.")
     @app_commands.guild_only()
     async def resume(interaction: discord.Interaction) -> None:
+        if not await check_music_channel(interaction):
+            return
         player = bot.music_players.get(interaction.guild_id)
         if not player or not player.voice_client or not player.voice_client.is_paused():
             await interaction.response.send_message("Nothing is paused.", ephemeral=True)
@@ -1294,14 +1438,36 @@ def register_commands(bot: ZodiacBot) -> None:
     @bot.tree.command(name="leave", description="Stop music and leave the voice channel.")
     @app_commands.guild_only()
     async def leave(interaction: discord.Interaction) -> None:
-        player = bot.music_players.pop(interaction.guild_id, None)
+        if not await check_music_channel(interaction):
+            return
+        player = bot.music_players.get(interaction.guild_id)
         if not player:
             await interaction.response.send_message("I am not in a voice channel.", ephemeral=True)
             return
-        await player.stop()
+        await interaction.response.defer(ephemeral=True)
+        async with player.connection_lock:
+            await player.stop()
+            bot.music_players.pop(interaction.guild_id, None)
         await publish_confirmation(
-            interaction, "Stopped playback and left the voice channel."
+            interaction, "Stopped playback and left the voice channel.", dismiss_original=True
         )
+
+    @bot.tree.command(name="queue", description="Show the current track and upcoming music.")
+    @app_commands.guild_only()
+    async def queue(interaction: discord.Interaction) -> None:
+        player = bot.music_players.get(interaction.guild_id)
+        if not player or (player.current is None and player.queue.empty()):
+            await interaction.response.send_message("The music queue is empty.", ephemeral=True)
+            return
+        lines = []
+        if player.current:
+            lines.append(f"Current: **{discord.utils.escape_markdown(player.current.title[:70])}**")
+        upcoming = list(player.queue._queue)
+        lines.extend(f"{index}. {discord.utils.escape_markdown(track.title[:70])}"
+                     for index, track in enumerate(upcoming[:10], 1))
+        if len(upcoming) > 10:
+            lines.append(f"…and {len(upcoming) - 10} more tracks.")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     @bot.tree.command(
         name="setup",
@@ -1333,7 +1499,7 @@ def register_commands(bot: ZodiacBot) -> None:
 
     @bot.tree.command(
         name="create_access",
-        description="Interactively create a permissioned role and private channel.",
+        description="Interactively create a role with permissions and a color.",
     )
     @administrator_only()
     @app_commands.guild_only()
@@ -1364,9 +1530,9 @@ def register_commands(bot: ZodiacBot) -> None:
             )
             return
         role = selected_role
-        if role == guild.default_role:
+        if role.managed or role == guild.default_role:
             await interaction.response.send_message(
-                "The @everyone role cannot be edited.", ephemeral=True
+                "The @everyone role and integration-managed roles cannot be edited.", ephemeral=True
             )
             return
         if not member.guild_permissions.manage_roles:
@@ -1422,7 +1588,9 @@ def register_commands(bot: ZodiacBot) -> None:
         roles = [
             role
             for role in reversed(guild.roles)
-            if not search or search in role.name.casefold()
+            if not role.managed and role != guild.default_role
+            and guild.me is not None and role < guild.me.top_role
+            and (not search or search in role.name.casefold())
         ]
         return [
             app_commands.Choice(name=role.name[:100], value=str(role.id))
@@ -1454,9 +1622,9 @@ def register_commands(bot: ZodiacBot) -> None:
                 "This command can only be used in a server.", ephemeral=True
             )
             return
-        if role == guild.default_role:
+        if role.managed or role == guild.default_role:
             await interaction.response.send_message(
-                "The @everyone role cannot be deleted.", ephemeral=True
+                "The @everyone role and integration-managed roles cannot be deleted.", ephemeral=True
             )
             return
         if not member.guild_permissions.manage_roles:
@@ -1470,17 +1638,17 @@ def register_commands(bot: ZodiacBot) -> None:
             )
             return
 
+        await interaction.response.defer(ephemeral=True)
         try:
             await role.delete(reason=f"Deleted by {interaction.user}")
         except discord.HTTPException:
             LOGGER.exception("Failed to delete role %s in guild %s", role.id, guild.id)
-            await interaction.response.send_message(
+            await send_error(interaction,
                 "Discord rejected the role deletion. Check my permissions and "
                 "role hierarchy.",
-                ephemeral=True,
             )
             return
-        await publish_confirmation(interaction, f"Deleted the `{role.name}` role.")
+        await publish_confirmation(interaction, f"Deleted the `{role.name}` role.", dismiss_original=True)
 
     @bot.tree.command(name="delete_channel", description="Delete a server channel.")
     @app_commands.describe(channel="Channel to delete")
@@ -1502,18 +1670,21 @@ def register_commands(bot: ZodiacBot) -> None:
             )
             return
 
+        if channel.id == interaction.channel_id:
+            await send_error(interaction, "Run /delete_channel from another channel so I can post the result there.")
+            return
+        await interaction.response.defer(ephemeral=True)
         try:
             await channel.delete(reason=f"Deleted by {interaction.user}")
         except discord.HTTPException:
             LOGGER.exception(
                 "Failed to delete channel %s in guild %s", channel.id, guild.id
             )
-            await interaction.response.send_message(
+            await send_error(interaction,
                 "Discord rejected the channel deletion. Check my permissions.",
-                ephemeral=True,
             )
             return
-        await publish_confirmation(interaction, f"Deleted the `#{channel.name}` channel.")
+        await publish_confirmation(interaction, f"Deleted the `#{channel.name}` channel.", dismiss_original=True)
 
     @bot.tree.command(
         name="add_twitch",
@@ -1522,6 +1693,7 @@ def register_commands(bot: ZodiacBot) -> None:
     @app_commands.describe(username="Twitch login name")
     @administrator_only()
     async def add_twitch(interaction: discord.Interaction, username: str) -> None:
+        username = normalize_twitch_username(username)
         await bot.database.add_twitch_account(
             interaction.guild_id, username.strip().lower()
         )
@@ -1532,7 +1704,7 @@ def register_commands(bot: ZodiacBot) -> None:
     )
     @administrator_only()
     async def remove_twitch(interaction: discord.Interaction, username: str) -> None:
-        normalized_username = username.strip().casefold()
+        normalized_username = normalize_twitch_username(username)
         removed = await bot.database.remove_twitch_account(
             interaction.guild_id, normalized_username
         )
@@ -1557,7 +1729,8 @@ def register_commands(bot: ZodiacBot) -> None:
         else:
             usernames = "\n".join(f"- `{account['username']}`" for account in accounts)
             message = f"Registered Twitch accounts:\n{usernames}"
-        await publish_confirmation(interaction, message)
+        for index in range(0, len(message), 1900):
+            await publish_confirmation(interaction, message[index:index + 1900])
 
     @bot.tree.command(
         name="clear", description="Delete recent messages from this channel."
@@ -1587,12 +1760,13 @@ def register_commands(bot: ZodiacBot) -> None:
         member: discord.Member,
         minutes: app_commands.Range[int, 1, 40320],
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
         await member.timeout(
             discord.utils.utcnow() + timedelta(minutes=minutes),
             reason=f"Moderated by {interaction.user}",
         )
-        await interaction.response.send_message(
-            f"Timed out {member.mention} for {minutes} minutes."
+        await publish_confirmation(
+            interaction, f"Timed out {member.mention} for {minutes} minutes.", dismiss_original=True
         )
 
     @bot.tree.command(name="kick", description="Kick a member.")
@@ -1600,35 +1774,44 @@ def register_commands(bot: ZodiacBot) -> None:
     async def kick(
         interaction: discord.Interaction,
         member: discord.Member,
-        reason: str = "No reason provided",
+        reason: app_commands.Range[str, 1, 400] = "No reason provided",
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
         await member.kick(reason=reason)
-        await interaction.response.send_message(f"Kicked {member} ({reason}).")
+        await publish_confirmation(interaction, f"Kicked {member} ({reason}).", dismiss_original=True)
 
     @bot.tree.command(name="ban", description="Ban a member.")
     @administrator_only()
     async def ban(
         interaction: discord.Interaction,
         member: discord.Member,
-        reason: str = "No reason provided",
+        reason: app_commands.Range[str, 1, 400] = "No reason provided",
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
         await member.ban(reason=reason)
-        await interaction.response.send_message(f"Banned {member} ({reason}).")
+        await publish_confirmation(interaction, f"Banned {member} ({reason}).", dismiss_original=True)
 
     @bot.tree.error
     async def on_app_command_error(
         interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
+        original = getattr(error, "original", error)
         if isinstance(error, app_commands.MissingPermissions):
             message = "You do not have permission to use this command."
+        elif isinstance(error, app_commands.NoPrivateMessage):
+            message = "This command can only be used in a server."
+        elif isinstance(original, discord.Forbidden):
+            message = "Discord denied that action. Check my channel permissions and role position."
+        elif isinstance(original, discord.NotFound):
+            message = "That member, role, channel, or message is no longer available."
+        elif isinstance(original, ValueError):
+            message = str(original)
+        elif isinstance(original, (aiohttp.ClientError, TimeoutError)):
+            message = "An external service could not be reached. Please try again shortly."
         else:
             LOGGER.exception("Slash command failed", exc_info=error)
             message = "The command failed. Check the bot logs for details."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-            await interaction.delete_original_response()
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+        await send_error(interaction, message)
 
 
 async def webhook_handler(request: web.Request) -> web.Response:
@@ -1636,24 +1819,34 @@ async def webhook_handler(request: web.Request) -> web.Response:
     provided = request.headers.get("X-Webhook-Secret", "")
     if not secrets.compare_digest(provided, bot.settings.webhook_secret):
         raise web.HTTPUnauthorized(text="Invalid webhook secret")
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        raise web.HTTPBadRequest(text="Request body must be valid JSON") from None
     nested_payload = payload.get("data", {}) if isinstance(payload, dict) else {}
     url = payload.get("url") if isinstance(payload, dict) else None
     if not url and isinstance(nested_payload, dict):
         url = nested_payload.get("url")
-    if not isinstance(url, str) or not url.startswith(
-        ("https://x.com/", "https://twitter.com/")
-    ):
+    if not isinstance(url, str) or not re.fullmatch(
+        r"https://(?:x\.com|twitter\.com)/[A-Za-z0-9_]+/status/[0-9]+(?:\?[^\s<>]*)?", url
+    ) or len(url) > 1500:
         raise web.HTTPBadRequest(text="Payload must contain an X post URL in `url`")
     guild_ids = await bot.database.list_guild_ids()
+    posted = 0
+    failed = 0
     for guild_id in guild_ids:
-        await bot.post_to_configured_channel(
-            guild_id,
-            f"New post from Zodiac eSports: {url}",
-            kind="social",
-            role_id=await bot.database.get_role(guild_id, "social"),
-        )
-    return web.json_response({"posted": len(guild_ids)})
+        try:
+            posted += bool(await bot.post_to_configured_channel(
+                guild_id,
+                f"New post from Zodiac eSports: {url}",
+                kind="social",
+                role_id=await bot.database.get_role(guild_id, "social"),
+            ))
+        except discord.HTTPException:
+            failed += 1
+            LOGGER.exception("Could not forward X post to guild %s", guild_id)
+    return web.json_response({"posted": posted, "failed": failed,
+                              "skipped": len(guild_ids) - posted - failed})
 
 
 async def run_webhook_server(bot: ZodiacBot) -> None:
@@ -1679,7 +1872,9 @@ async def main() -> None:
     await database.initialize()
     bot = ZodiacBot(settings, database)
     register_commands(bot)
-    await asyncio.gather(bot.start(settings.discord_token), run_webhook_server(bot))
+    async with bot:
+        await run_webhook_server(bot)
+        await bot.start(settings.discord_token)
 
 
 if __name__ == "__main__":

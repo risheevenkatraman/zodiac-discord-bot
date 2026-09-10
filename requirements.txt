@@ -1,4 +1,4 @@
-discord.py>=2.4,<3
+discord.py[voice]>=2.4,<3
 aiohttp>=3.10,<4
 python-dotenv>=1.0,<2
-yt-dlp>=2025.1
+yt-dlp[default]>=2026.8.19
