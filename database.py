@@ -40,6 +40,15 @@ class Database:
                 username TEXT NOT NULL,
                 PRIMARY KEY (guild_id, username)
             );
+            CREATE TABLE IF NOT EXISTS x_deliveries (
+                guild_id INTEGER NOT NULL,
+                post_id TEXT NOT NULL,
+                PRIMARY KEY (guild_id, post_id)
+            );
+            CREATE TABLE IF NOT EXISTS x_checkpoints (
+                user_id TEXT PRIMARY KEY,
+                post_id TEXT NOT NULL
+            );
             """
         )
         self.connection.commit()
@@ -141,7 +150,37 @@ class Database:
             )
             connection.commit()
 
-    async def list_guild_ids(self) -> list[int]:
+    async def list_guild_ids(self, kind: str | None = None) -> list[int]:
         async with self.lock:
-            rows = self._require_connection().execute("SELECT DISTINCT guild_id FROM channels").fetchall()
+            connection = self._require_connection()
+            rows = (connection.execute("SELECT DISTINCT guild_id FROM channels WHERE kind = ?", (kind,))
+                    if kind else connection.execute("SELECT DISTINCT guild_id FROM channels")).fetchall()
             return [int(row["guild_id"]) for row in rows]
+
+    async def x_post_delivered(self, guild_id: int, post_id: str) -> bool:
+        async with self.lock:
+            return self._require_connection().execute(
+                "SELECT 1 FROM x_deliveries WHERE guild_id = ? AND post_id = ?",
+                (guild_id, post_id),
+            ).fetchone() is not None
+
+    async def mark_x_post_delivered(self, guild_id: int, post_id: str) -> None:
+        async with self.lock:
+            connection = self._require_connection()
+            with connection:
+                connection.execute(
+                    "INSERT OR IGNORE INTO x_deliveries VALUES (?, ?)", (guild_id, post_id)
+                )
+
+    async def get_x_checkpoint(self, user_id: str) -> str | None:
+        async with self.lock:
+            row = self._require_connection().execute(
+                "SELECT post_id FROM x_checkpoints WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            return row["post_id"] if row else None
+
+    async def set_x_checkpoint(self, user_id: str, post_id: str) -> None:
+        async with self.lock:
+            connection = self._require_connection()
+            with connection:
+                connection.execute("INSERT OR REPLACE INTO x_checkpoints VALUES (?, ?)", (user_id, post_id))

@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 
 from database import Database
 from media import MediaError, extract_info, extraction_options
+from x_feed import XMonitor, account_username, post_identity
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -52,6 +53,9 @@ class Settings:
     ytdlp_cookies_file: str | None = None
     ytdlp_js_runtime: str | None = None
     spotify_refresh_token: str | None = None
+    x_account: str | None = None
+    x_bearer_token: str | None = None
+    x_poll_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -77,6 +81,9 @@ class Settings:
             ytdlp_cookies_file=os.getenv("YTDLP_COOKIES_FILE") or None,
             ytdlp_js_runtime=os.getenv("YTDLP_JS_RUNTIME") or None,
             spotify_refresh_token=os.getenv("SPOTIFY_REFRESH_TOKEN") or None,
+            x_account=account_username(os.getenv("X_ACCOUNT", "zodiacsesport")) if os.getenv("X_ACCOUNT", "zodiacsesport") else None,
+            x_bearer_token=os.getenv("X_BEARER_TOKEN") or None,
+            x_poll_seconds=max(60, int(os.getenv("X_POLL_SECONDS", "300"))),
         )
 
 
@@ -185,14 +192,28 @@ class ZodiacBot(commands.Bot):
         self.spotify_token_expires_at = 0.0
         self.spotify_refresh_token = settings.spotify_refresh_token
         self.media_lock = asyncio.Lock()
+        self.x_delivery_lock = asyncio.Lock()
+        self.x_monitor = None
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         await self.tree.sync()
         self.twitch_poll_loop.change_interval(seconds=self.settings.twitch_poll_seconds)
         self.twitch_poll_loop.start()
+        if self.settings.x_account and self.settings.x_bearer_token:
+            self.x_monitor = XMonitor(self.settings.x_account, self.settings.x_bearer_token,
+                                     self.database, self.forward_x_post)
+            self.x_poll_loop.change_interval(seconds=self.settings.x_poll_seconds)
+            self.x_poll_loop.start()
+        else:
+            LOGGER.info("X monitoring disabled: configure X_ACCOUNT and X_BEARER_TOKEN")
 
     async def close(self) -> None:
+        self.x_poll_loop.cancel()
+        x_task = self.x_poll_loop.get_task()
+        if x_task:
+            with suppress(asyncio.CancelledError):
+                await x_task
         self.twitch_poll_loop.cancel()
         if self.webhook_runner:
             await self.webhook_runner.cleanup()
@@ -203,6 +224,27 @@ class ZodiacBot(commands.Bot):
         self.music_players.clear()
         await super().close()
         await self.database.close()
+
+    async def forward_x_post(self, username: str, post_id: str) -> bool:
+        async with self.x_delivery_lock:
+            result = await deliver_x_post(self, f"https://x.com/{username}/status/{post_id}", post_id, username)
+            return result.status == 200
+
+    @tasks.loop(seconds=300)
+    async def x_poll_loop(self) -> None:
+        if self.x_monitor is None or self.http_session is None:
+            return
+        try:
+            guild_ids = await self.database.list_guild_ids()
+            destinations = [await self.database.get_channel(guild_id, "social") for guild_id in guild_ids]
+            if any(destinations):
+                await self.x_monitor.poll(self.http_session)
+        except (aiohttp.ClientError, TimeoutError, RuntimeError):
+            LOGGER.exception("X monitoring failed; will retry")
+
+    @x_poll_loop.before_loop
+    async def before_x_poll_loop(self) -> None:
+        await self.wait_until_ready()
 
     def music_player(self, guild_id: int) -> GuildMusicPlayer:
         player = self.music_players.get(guild_id)
@@ -1817,7 +1859,7 @@ def register_commands(bot: ZodiacBot) -> None:
 async def webhook_handler(request: web.Request) -> web.Response:
     bot: ZodiacBot = request.app["bot"]
     provided = request.headers.get("X-Webhook-Secret", "")
-    if not secrets.compare_digest(provided, bot.settings.webhook_secret):
+    if not secrets.compare_digest(provided.encode(), bot.settings.webhook_secret.encode()):
         raise web.HTTPUnauthorized(text="Invalid webhook secret")
     try:
         payload = await request.json()
@@ -1827,26 +1869,49 @@ async def webhook_handler(request: web.Request) -> web.Response:
     url = payload.get("url") if isinstance(payload, dict) else None
     if not url and isinstance(nested_payload, dict):
         url = nested_payload.get("url")
-    if not isinstance(url, str) or not re.fullmatch(
-        r"https://(?:x\.com|twitter\.com)/[A-Za-z0-9_]+/status/[0-9]+(?:\?[^\s<>]*)?", url
-    ) or len(url) > 1500:
+    if not isinstance(url, str) or len(url) > 1500:
         raise web.HTTPBadRequest(text="Payload must contain an X post URL in `url`")
-    guild_ids = await bot.database.list_guild_ids()
+    try:
+        username, post_id = post_identity(url)
+    except ValueError:
+        raise web.HTTPBadRequest(text="Payload must contain an X post URL in `url`") from None
+    if not bot.settings.x_account:
+        raise web.HTTPServiceUnavailable(text="Configure X_ACCOUNT before accepting X posts")
+    if username != bot.settings.x_account:
+        return web.json_response({"posted": 0, "ignored": True, "reason": "different_account"})
+    url = f"https://x.com/{username}/status/{post_id}"
+    async with bot.x_delivery_lock:
+        return await deliver_x_post(bot, url, post_id, username)
+
+
+async def deliver_x_post(bot: ZodiacBot, url: str, post_id: str, username: str) -> web.Response:
+    guild_ids = await bot.database.list_guild_ids("social")
     posted = 0
     failed = 0
+    duplicates = 0
     for guild_id in guild_ids:
+        if await bot.database.x_post_delivered(guild_id, post_id):
+            duplicates += 1
+            continue
         try:
-            posted += bool(await bot.post_to_configured_channel(
+            delivered = await bot.post_to_configured_channel(
                 guild_id,
-                f"New post from Zodiac eSports: {url}",
+                f"New post from @{username}: {url}",
                 kind="social",
                 role_id=await bot.database.get_role(guild_id, "social"),
-            ))
+            )
+            if delivered:
+                await bot.database.mark_x_post_delivered(guild_id, post_id)
+                posted += 1
+            else:
+                failed += 1
         except discord.HTTPException:
             failed += 1
             LOGGER.exception("Could not forward X post to guild %s", guild_id)
     return web.json_response({"posted": posted, "failed": failed,
-                              "skipped": len(guild_ids) - posted - failed})
+                              "duplicates": duplicates,
+                              "skipped": len(guild_ids) - posted - failed - duplicates},
+                             status=503 if failed else 200)
 
 
 async def run_webhook_server(bot: ZodiacBot) -> None:

@@ -62,8 +62,8 @@ permission. Music commands are available to server members.
 - Twitch Helix polling with persisted live notification state across restarts,
   batched requests, and support for the same streamer in multiple servers.
 - Authenticated X webhook endpoint at `POST /webhooks/x`.
-- X post URL forwarding to the configured social channel with optional role
-  mentions.
+- Automatic monitoring of @zodiacsesport through the X API, with new post links
+  forwarded to the configured social channel and optional role mentions.
 - SQLite persistence for configured channels, roles, and Twitch accounts.
 - Environment-based configuration for tokens, secrets, polling, and database
   paths.
@@ -120,69 +120,6 @@ and restart the bot. Slash commands, including `/queue`, sync on startup.
 - `.env.example` - Template for local or hosted environment variables.
 - `.github/workflows/deploy.yml` - GitHub Actions AWS deployment workflow.
 - `deploy/zodiac-bot.service` - Linux systemd service definition.
-
-## External integrations
-
-### Music troubleshooting and host setup
-
-Spotify links supply song metadata; the bot searches YouTube for matching audio.
-A YouTube verification failure can therefore affect both services. Playback
-failures now appear in the channel where `/play` was used, even after queuing.
-
-Install the updated requirements on the host. `yt-dlp[default]` includes its
-JavaScript challenge scripts. Also install **Deno 2.3+** or **Node.js 22+** where
-the `ubuntu` service user can execute it. The bot enables both by default; set
-`YTDLP_JS_RUNTIME=node:/usr/bin/node` (using the actual executable path) in
-`/etc/zodiac-bot.env` if discovery fails. See the
-[yt-dlp runtime installation guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
-FFmpeg is still required separately.
-
-For YouTube's “sign in to confirm you're not a bot” challenge, the bot supports
-`YTDLP_COOKIES_FILE=/home/ubuntu/.config/zodiac/youtube-cookies.txt`. Export your
-own YouTube session in Netscape cookie format using the
-[yt-dlp cookie instructions](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies),
-and transfer it privately to that path. The service user must be able to read
-and write the file because yt-dlp saves cookie updates. On Linux, restrict the
-directory to mode 700 and the file to mode 600, owned by `ubuntu`.
-Cookies are login credentials: do not commit or share them. Cookie authentication
-can expire and does not guarantee acceptance from a hosting IP. If access is
-still denied, follow the upstream
-[PO-token troubleshooting guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide);
-the bot does not generate these tokens. Using an account with yt-dlp can result
-in account restrictions, as noted in its cookie guide.
-
-For Spotify, keep the client ID and secret in `/etc/zodiac-bot.env`. The parser
-accepts both old and new playlist fields. Spotify's
-[2026 Development Mode changes](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide)
-require Premium for the app owner and restrict playlist contents to eligible
-owners/collaborators. App credentials alone may return playlist metadata without
-song details. To authorize your user:
-
-1. Add `http://127.0.0.1:8888/callback` to your Spotify app's redirect URIs.
-2. On your local computer, run `python spotify_auth.py` from the project directory.
-   Supply the same app credentials when prompted, then open the printed URL in
-   a browser on that computer and authorize the playlist owner/collaborator.
-3. The helper saves `spotify-token.env` without printing the refresh token.
-   Copy its `SPOTIFY_REFRESH_TOKEN` setting privately into `/etc/zodiac-bot.env`
-   on the host and restart the bot. The helper file is ignored by Git and excluded
-   from deployment. No callback port needs to be opened on the bot host.
-
-This authorization only permits metadata access allowed by Spotify. It does not
-enable direct Spotify audio streaming or grant access to other users' restricted
-playlists. Without user authorization, supported track metadata still uses the
-client credentials flow. Spotify HTTP errors now distinguish credential failures,
-access restrictions, unavailable content, and rate limits.
-
-The bot does not scrape or directly monitor X. An external X automation
-provider must send approved post URLs to the authenticated webhook endpoint.
-The webhook accepts X/Twitter URLs and forwards them to the configured Discord
-social channel.
-
-Send JSON such as `{"url":"https://x.com/example/status/123"}` with the
-`X-Webhook-Secret` header. A nested `data.url` is also accepted. The response
-reports `posted`, `failed`, and `skipped` destination counts. Invalid JSON and
-URLs that are not post links return HTTP 400. Webhook retries are not deduplicated,
-so the caller should avoid resending successfully delivered posts.
 
 Twitch monitoring is built into the bot and uses the configured Twitch
 application credentials to poll registered accounts.

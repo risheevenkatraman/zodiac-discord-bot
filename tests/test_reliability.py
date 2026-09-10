@@ -162,8 +162,11 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_webhook_counts_actual_deliveries(self):
         bot = SimpleNamespace(
-            settings=SimpleNamespace(webhook_secret='test'),
+            settings=SimpleNamespace(webhook_secret='test', x_account='example'),
+            x_delivery_lock=asyncio.Lock(),
             database=SimpleNamespace(list_guild_ids=AsyncMock(return_value=[1, 2]),
+                                     x_post_delivered=AsyncMock(return_value=False),
+                                     mark_x_post_delivered=AsyncMock(),
                                      get_role=AsyncMock(return_value=None)),
             post_to_configured_channel=AsyncMock(side_effect=[True, False]),
         )
@@ -171,7 +174,8 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                                   json=AsyncMock(return_value={'url': 'https://x.com/example/status/123'}))
         response = await webhook_handler(request)
         self.assertIn('"posted": 1', response.text)
-        self.assertIn('"skipped": 1', response.text)
+        self.assertIn('"failed": 1', response.text)
+        self.assertEqual(response.status, 503)
 
     async def test_all_commands_register_as_guild_only(self):
         bot = ZodiacBot(Mock(), SimpleNamespace(close=AsyncMock()))
