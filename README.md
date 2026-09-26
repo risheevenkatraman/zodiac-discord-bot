@@ -16,15 +16,30 @@ and private channels without manually editing permission overwrites.
 
 ### Server configuration
 
+- `/welcome channel:#welcome` - Post the styled Zodiac welcome message and website
+  button to a text channel. Optionally supply up to five social pairs:
+  `platform_1:X link_1:https://x.com/your_handle` through `platform_5` / `link_5`.
+  Each pair needs both a name and an HTTP(S) link. Only administrators can run it;
+  the bot needs View Channel, Send Messages, and Embed Links at the destination.
+  Each invocation posts a new message without pinging anyone.
 - `/setup` - Configure the X/social notification channel, Twitch notification
   channel, and role to mention.
-- `/create_access` - Open a GUI that creates a role with a selected color and
+- `/create_role` - Open a GUI that creates a role with a selected color and
   Discord permissions.
 - `/edit_role` - Edit an existing role's Discord permissions and the channels it
   can access.
 - `/create_channel` - Open a GUI to choose a category, select roles, and create a
-  private text channel with the appropriate permission overwrites.
+  text or voice channel with the appropriate permission overwrites. All server
+  roles are available through **Previous roles** / **Next roles**, with selections
+  kept across pages. Channels are private unless you select `@everyone`.
 - `/delete_role` - Delete a selected server role.
+- `/edit_channel channel:#channel` - Edit role access for an existing text or voice
+  channel. Currently accessible roles are preselected; select or deselect roles
+  across pages, then save. Only changed roles are updated, preserving unrelated
+  permissions and member overrides. Voice access also updates Connect. The bot
+  needs Manage Roles in the destination channel. Administrators bypass channel
+  restrictions, and other roles or member overrides can still grant access.
+  Editing access may unsync the channel from its category.
 - `/delete_channel` - Delete a selected text channel.
   Run this from a different channel so the confirmation has somewhere to appear.
 
@@ -52,6 +67,14 @@ permission. Music commands are available to server members.
 
 ## Features
 
+- Automatic personalized join cards after Discord's native join message, using
+  `assets/zodiac-banner.png`, the new member's display avatar/name, and the current
+  server member count. Enable join notifications in Discord's System Messages
+  Channel settings and grant the bot View Channel, Send Messages, and Attach Files
+  there. Cards follow the native message; intervening chat messages are possible.
+  No Message Content intent is needed. Member numbers reflect current membership
+  (including bots), not a permanent join-order ID. If an avatar cannot be loaded,
+  the card uses a Zodiac initial. Rendering uses Pillow locally.
 - Discord application-command interface using slash commands.
 - Permission checks for moderation and server administration commands.
 - Interactive modals, role selectors, channel selectors, and confirmation

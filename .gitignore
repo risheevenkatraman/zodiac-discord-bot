@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 *cookies*.txt
 spotify-token.env
+/docs/

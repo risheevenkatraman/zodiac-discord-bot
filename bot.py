@@ -7,7 +7,7 @@ import os
 import re
 import secrets
 import time
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any
@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from database import Database
 from media import MediaError, extract_info, extraction_options
 from x_feed import XMonitor, account_username, post_identity
+from welcome_card import render_join_card
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -194,6 +195,40 @@ class ZodiacBot(commands.Bot):
         self.media_lock = asyncio.Lock()
         self.x_delivery_lock = asyncio.Lock()
         self.x_monitor = None
+        self.join_card_lock = asyncio.Lock()
+        self.join_card_messages: set[int] = set()
+
+    async def on_message(self, message: discord.Message) -> None:
+        if message.type != discord.MessageType.new_member:
+            await self.process_commands(message)
+            return
+        guild = message.guild
+        if guild is None or guild.system_channel is None or message.channel.id != guild.system_channel.id:
+            return
+        member_count = guild.member_count
+        async with self.join_card_lock:
+            if message.id in self.join_card_messages:
+                return
+            permissions = message.channel.permissions_for(guild.me) if guild.me else None
+            if permissions is None or not (permissions.view_channel and permissions.send_messages and permissions.attach_files):
+                LOGGER.warning('Cannot post join card in guild %s: missing channel permissions', guild.id)
+                return
+            try:
+                try:
+                    avatar = await message.author.display_avatar.with_size(256).with_format('png').read()
+                except (discord.HTTPException, aiohttp.ClientError, TimeoutError):
+                    LOGGER.warning('Avatar unavailable for joining member %s; using fallback', message.author.id)
+                    avatar = None
+                card = await asyncio.to_thread(render_join_card, message.author.display_name, member_count, avatar)
+                with closing(discord.File(card, filename='zodiac-welcome.png',
+                                  description=f'{message.author.display_name} just joined Zodiac. Member #{member_count}'
+                                  if member_count is not None else 'Welcome to Zodiac')) as attachment:
+                    await message.channel.send(file=attachment, allowed_mentions=discord.AllowedMentions.none())
+                self.join_card_messages.add(message.id)
+                if len(self.join_card_messages) > 1000:
+                    self.join_card_messages.remove(min(self.join_card_messages))
+            except (discord.HTTPException, aiohttp.ClientError, TimeoutError, OSError, ValueError):
+                LOGGER.exception('Could not post join card in guild %s', guild.id)
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
@@ -1167,17 +1202,20 @@ class ChannelSetupModal(SetupModal, title="Create private channel"):
                 "This setup can only be used in a server.", ephemeral=True
             )
             return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        roles = await interaction.guild.fetch_roles()
         view = ChannelSetupView(
             owner_id=self.owner_id,
             bot=self.bot,
-            channel_name=str(self.channel_name).strip().lower().replace(" ", "-"),
-            roles=[role for role in interaction.guild.roles if role != interaction.guild.default_role],
+            channel_name=str(self.channel_name).strip(),
+            roles=list(reversed(roles)),
         )
-        await interaction.response.send_message(
-            "Select a category and the roles that should access the channel, "
-            "then click **Create**.",
+        await interaction.edit_original_response(
+            content=("Choose text or voice, a category, and roles, then click **Create**. "
+                     f"All {len(roles)} server roles are available in pages of 25; "
+                     "use **Next roles** to see more. Selections are kept across pages. "
+                     "Selecting **@everyone** gives everyone access."),
             view=view,
-            ephemeral=True,
         )
         view.message = await interaction.original_response()
 
@@ -1239,6 +1277,7 @@ class ChannelSetupView(SetupView):
         self.owner_id = owner_id
         self.bot = bot
         self.channel_name = channel_name
+        self.channel_type = "text"
         self.category_id: int | None = None
         self.selected_role_ids: list[int] = []
         self.message: discord.WebhookMessage | None = None
@@ -1258,6 +1297,7 @@ class ChannelSetupView(SetupView):
         self.role_select.refresh_options()
         self.previous_page.disabled = self.role_page == 0
         self.next_page.disabled = self.role_page == len(self.role_pages) - 1
+        self.next_page.label = f"Next roles ({self.role_page + 1}/{len(self.role_pages)})"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
@@ -1266,6 +1306,22 @@ class ChannelSetupView(SetupView):
             "Only the person who opened this setup can use it.", ephemeral=True
         )
         return False
+
+    @discord.ui.select(
+        placeholder="Choose channel type",
+        options=[
+            discord.SelectOption(label="Text channel", value="text", default=True),
+            discord.SelectOption(label="Voice channel", value="voice"),
+        ],
+        row=3,
+    )
+    async def channel_kind(
+        self, interaction: discord.Interaction, select: discord.ui.Select
+    ) -> None:
+        self.channel_type = select.values[0]
+        for option in select.options:
+            option.default = option.value == self.channel_type
+        await interaction.response.edit_message(view=self)
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
@@ -1337,7 +1393,6 @@ class ChannelSetupView(SetupView):
             role
             for role_id in self.selected_role_ids
             if (role := guild.get_role(role_id)) is not None
-            and role != guild.default_role
         ]
         if not isinstance(category, discord.CategoryChannel):
             await interaction.response.send_message(
@@ -1361,12 +1416,21 @@ class ChannelSetupView(SetupView):
                 send_messages=True,
                 read_message_history=True,
             )
+        if self.channel_type == "voice":
+            for target in [member, *selected_roles]:
+                overwrites[target].connect = True
+                overwrites[target].speak = True
 
         if not await self.begin_operation(interaction):
             return
         try:
-            channel = await guild.create_text_channel(
-                self.channel_name,
+            create_channel = (
+                guild.create_voice_channel if self.channel_type == "voice"
+                else guild.create_text_channel
+            )
+            channel = await create_channel(
+                self.channel_name if self.channel_type == "voice"
+                else self.channel_name.lower().replace(" ", "-"),
                 category=category,
                 overwrites=overwrites,
                 reason=f"Channel setup by {interaction.user}",
@@ -1388,7 +1452,163 @@ class ChannelSetupView(SetupView):
         )
 
 
+class ChannelEditView(ChannelSetupView):
+    def __init__(
+        self, owner_id: int, bot: ZodiacBot,
+        channel: discord.TextChannel | discord.VoiceChannel, roles: list[discord.Role],
+    ) -> None:
+        super().__init__(owner_id, bot, channel.name, roles)
+        self.channel_id = channel.id
+        self.voice = isinstance(channel, discord.VoiceChannel)
+        self.initial_role_ids = {
+            role.id for role in roles
+            if channel.permissions_for(role).view_channel
+            and (not self.voice or channel.permissions_for(role).connect)
+        }
+        self.selected_role_ids = list(self.initial_role_ids)
+        for item in (self.category, self.channel_kind, self.create):
+            self.remove_item(item)
+        self.refresh_role_controls()
+
+    @discord.ui.button(label="Save changes", style=discord.ButtonStyle.success, row=2)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self.begin_operation(interaction):
+            return
+        guild = interaction.guild
+        if guild is None or guild.me is None:
+            await send_error(interaction, "This editor can only be used in a server.")
+            return
+        try:
+            channel = await guild.fetch_channel(self.channel_id)
+            if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+                await send_error(interaction, "That channel is no longer available.")
+                return
+            permissions = channel.permissions_for(guild.me)
+            if not permissions.manage_roles:
+                await send_error(interaction, "I need **Manage Roles** in that channel to edit permission overwrites.")
+                return
+            roles = {role.id: role for role in await guild.fetch_roles()}
+            selected = set(self.selected_role_ids)
+            changed = selected ^ self.initial_role_ids
+            if changed - roles.keys():
+                await send_error(interaction, "A role in this edit was deleted. Run /edit_channel again.")
+                return
+            for role_id in changed:
+                role = roles[role_id]
+                overwrite = channel.overwrites_for(role)
+                overwrite.view_channel = role_id in selected
+                if self.voice:
+                    overwrite.connect = role_id in selected
+                await channel.set_permissions(
+                    role, overwrite=overwrite,
+                    reason=f"Channel access edited by {interaction.user}",
+                )
+        except discord.HTTPException:
+            LOGGER.exception("Failed to edit channel access for %s", self.channel_id)
+            await send_error(interaction, "Discord could not finish updating channel access. Some changes may already have been applied; reopen /edit_channel to review.")
+            return
+        await publish_confirmation(
+            interaction, f"Updated role access for {channel.mention}.", dismiss_original=True,
+        )
+
+
+def build_welcome_message(
+    socials: list[tuple[str | None, str | None]],
+) -> tuple[discord.Embed, discord.ui.View]:
+    links = []
+    for platform, url in socials:
+        if platform is None and url is None:
+            continue
+        if not platform or not url:
+            raise ValueError("Each social needs both a platform name and a link.")
+        platform, url = platform.strip(), url.strip()
+        if not platform or len(platform) > 80 or any(c in platform for c in '\r\n'):
+            raise ValueError("Platform names must be 1–80 characters on one line.")
+        try:
+            parsed = urlparse(url)
+            valid = parsed.scheme in ('https', 'http') and bool(parsed.hostname)
+        except ValueError:
+            valid = False
+        if not valid or len(url) > 512 or any(c.isspace() for c in url):
+            raise ValueError("Social links must be valid HTTP(S) URLs of at most 512 characters.")
+        links.append((platform, url))
+
+    embed = discord.Embed(
+        title="Welcome to Zodiac eSports",
+        description=(
+            "**Written in the Stars. Destined for Victory.**\n\n"
+            "Welcome to the **Zodiac eSports Community Discord** — "
+            "your place in our constellation of players and fans.\n\n"
+            "From Overwatch to VALORANT, we're here to cheer on our teams, "
+            "share the grind, and build friendships beyond the match. "
+            "Introduce yourself, find your squad, and help shape what comes next."
+        ),
+        colour=discord.Colour(0xB78ADF),
+    )
+    embed.add_field(
+        name="EXPLORE ZODIAC",
+        value="Meet our teams, discover our community, and explore [zodiacgg.com](https://www.zodiacgg.com).",
+        inline=False,
+    )
+    if links:
+        embed.add_field(
+            name="STAY CONNECTED",
+            value="Follow our teams and catch the latest from our constellation below.",
+            inline=False,
+        )
+    embed.set_footer(text="ZODIAC ESPORTS • EST. 2024 • Built by players. Connected by something bigger.")
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        label="Visit our website", url="https://www.zodiacgg.com", row=0,
+    ))
+    for platform, url in links:
+        view.add_item(discord.ui.Button(label=platform, url=url, row=1))
+    return embed, view
+
+
 def register_commands(bot: ZodiacBot) -> None:
+    @bot.tree.command(name="welcome", description="Post the Zodiac welcome message to a channel.")
+    @administrator_only()
+    @app_commands.describe(
+        channel="Text channel to receive the welcome message",
+        platform_1="First social platform name", link_1="First social URL",
+        platform_2="Second social platform name", link_2="Second social URL",
+        platform_3="Third social platform name", link_3="Third social URL",
+        platform_4="Fourth social platform name", link_4="Fourth social URL",
+        platform_5="Fifth social platform name", link_5="Fifth social URL",
+    )
+    async def welcome(
+        interaction: discord.Interaction, channel: discord.TextChannel,
+        platform_1: str | None = None, link_1: str | None = None,
+        platform_2: str | None = None, link_2: str | None = None,
+        platform_3: str | None = None, link_3: str | None = None,
+        platform_4: str | None = None, link_4: str | None = None,
+        platform_5: str | None = None, link_5: str | None = None,
+    ) -> None:
+        try:
+            embed, view = build_welcome_message([
+                (platform_1, link_1), (platform_2, link_2), (platform_3, link_3),
+                (platform_4, link_4), (platform_5, link_5),
+            ])
+        except ValueError as error:
+            await send_error(interaction, str(error))
+            return
+        member = interaction.guild.me if interaction.guild else None
+        if member is None or channel.guild.id != interaction.guild.id:
+            await send_error(interaction, "Choose a text channel in this server.")
+            return
+        permissions = channel.permissions_for(member)
+        if not (permissions.view_channel and permissions.send_messages and permissions.embed_links):
+            await send_error(interaction, "I need View Channel, Send Messages, and Embed Links in that channel.")
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            message = await channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            await send_error(interaction, "Discord could not post the welcome message. Check my channel permissions and try again.")
+            return
+        await interaction.edit_original_response(content=f"[Welcome message posted]({message.jump_url}) in {channel.mention}.")
+
     @bot.tree.command(
         name="play", description="Join your voice channel and play a YouTube or Spotify link."
     )
@@ -1540,12 +1760,12 @@ def register_commands(bot: ZodiacBot) -> None:
         )
 
     @bot.tree.command(
-        name="create_access",
+        name="create_role",
         description="Interactively create a role with permissions and a color.",
     )
     @administrator_only()
     @app_commands.guild_only()
-    async def create_access(interaction: discord.Interaction) -> None:
+    async def create_role(interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(
             AccessSetupModal(interaction.user.id, bot)
         )
@@ -1649,6 +1869,34 @@ def register_commands(bot: ZodiacBot) -> None:
         await interaction.response.send_modal(
             ChannelSetupModal(interaction.user.id, bot)
         )
+
+    @bot.tree.command(name="edit_channel", description="Edit which roles can access a text or voice channel.")
+    @app_commands.describe(channel="Channel whose role access you want to edit")
+    @administrator_only()
+    async def edit_channel(
+        interaction: discord.Interaction, channel: discord.TextChannel | discord.VoiceChannel,
+    ) -> None:
+        if interaction.guild is None or channel.guild.id != interaction.guild.id:
+            await send_error(interaction, "Choose a channel in this server.")
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            channel = await interaction.guild.fetch_channel(channel.id)
+            roles = await interaction.guild.fetch_roles()
+        except discord.HTTPException:
+            await send_error(interaction, "I could not load that channel and its roles. Check my access and try again.")
+            return
+        view = ChannelEditView(interaction.user.id, bot, channel, list(reversed(roles)))
+        await interaction.edit_original_response(
+            content=(f"Edit role access for {channel.mention}. Currently accessible roles are selected. "
+                     "Use **Previous roles** / **Next roles** for all roles; selections persist across pages. "
+                     "Select roles to grant access or deselect them to deny access, then **Save changes**. "
+                     "Only changed roles are updated. Selecting @everyone opens access to everyone. "
+                     "Administrators bypass restrictions; other roles and member-specific overrides can still grant access. "
+                     "Saving changes may unsync this channel from its category."),
+            view=view,
+        )
+        view.message = await interaction.original_response()
 
     @bot.tree.command(name="delete_role", description="Delete a server role.")
     @app_commands.describe(role="Role to delete")

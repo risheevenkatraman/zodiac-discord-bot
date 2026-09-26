@@ -181,6 +181,9 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         bot = ZodiacBot(Mock(), SimpleNamespace(close=AsyncMock()))
         try:
             register_commands(bot)
+            self.assertIsNotNone(bot.tree.get_command('create_role'))
+            self.assertTrue(bot.tree.get_command('edit_channel').default_permissions.administrator)
+            self.assertIsNone(bot.tree.get_command('create_access'))
             self.assertIn('queue', [command.name for command in bot.tree.get_commands()])
             self.assertTrue(all(command.guild_only for command in bot.tree.get_commands()))
             for command in bot.tree.get_commands():
