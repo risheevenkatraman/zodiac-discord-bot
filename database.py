@@ -67,35 +67,61 @@ class Database:
     async def set_channel(self, guild_id: int, kind: str, channel_id: int) -> None:
         async with self.lock:
             connection = self._require_connection()
-            connection.execute("INSERT OR REPLACE INTO channels VALUES (?, ?, ?)", (guild_id, kind, channel_id))
+            connection.execute(
+                "INSERT OR REPLACE INTO channels VALUES (?, ?, ?)",
+                (guild_id, kind, channel_id),
+            )
             connection.commit()
 
     async def get_channel(self, guild_id: int, kind: str) -> int | None:
         async with self.lock:
-            row = self._require_connection().execute("SELECT channel_id FROM channels WHERE guild_id = ? AND kind = ?", (guild_id, kind)).fetchone()
+            row = (
+                self._require_connection()
+                .execute(
+                    "SELECT channel_id FROM channels WHERE guild_id = ? AND kind = ?",
+                    (guild_id, kind),
+                )
+                .fetchone()
+            )
             return int(row["channel_id"]) if row else None
 
     async def set_role(self, guild_id: int, kind: str, role_id: int) -> None:
         async with self.lock:
             connection = self._require_connection()
-            connection.execute("INSERT OR REPLACE INTO roles VALUES (?, ?, ?)", (guild_id, kind, role_id))
+            connection.execute(
+                "INSERT OR REPLACE INTO roles VALUES (?, ?, ?)",
+                (guild_id, kind, role_id),
+            )
             connection.commit()
 
     async def get_role(self, guild_id: int, kind: str) -> int | None:
         async with self.lock:
-            row = self._require_connection().execute("SELECT role_id FROM roles WHERE guild_id = ? AND kind = ?", (guild_id, kind)).fetchone()
+            row = (
+                self._require_connection()
+                .execute(
+                    "SELECT role_id FROM roles WHERE guild_id = ? AND kind = ?",
+                    (guild_id, kind),
+                )
+                .fetchone()
+            )
             return int(row["role_id"]) if row else None
 
     async def add_twitch_account(self, guild_id: int, username: str) -> None:
         async with self.lock:
             connection = self._require_connection()
-            connection.execute("INSERT OR IGNORE INTO twitch_accounts VALUES (?, ?)", (guild_id, username))
+            connection.execute(
+                "INSERT OR IGNORE INTO twitch_accounts VALUES (?, ?)",
+                (guild_id, username),
+            )
             connection.commit()
 
     async def remove_twitch_account(self, guild_id: int, username: str) -> bool:
         async with self.lock:
             connection = self._require_connection()
-            cursor = connection.execute("DELETE FROM twitch_accounts WHERE guild_id = ? AND username = ?", (guild_id, username))
+            cursor = connection.execute(
+                "DELETE FROM twitch_accounts WHERE guild_id = ? AND username = ?",
+                (guild_id, username),
+            )
             connection.commit()
             return cursor.rowcount > 0
 
@@ -153,34 +179,52 @@ class Database:
     async def list_guild_ids(self, kind: str | None = None) -> list[int]:
         async with self.lock:
             connection = self._require_connection()
-            rows = (connection.execute("SELECT DISTINCT guild_id FROM channels WHERE kind = ?", (kind,))
-                    if kind else connection.execute("SELECT DISTINCT guild_id FROM channels")).fetchall()
+            rows = (
+                connection.execute(
+                    "SELECT DISTINCT guild_id FROM channels WHERE kind = ?", (kind,)
+                )
+                if kind
+                else connection.execute("SELECT DISTINCT guild_id FROM channels")
+            ).fetchall()
             return [int(row["guild_id"]) for row in rows]
 
     async def x_post_delivered(self, guild_id: int, post_id: str) -> bool:
         async with self.lock:
-            return self._require_connection().execute(
-                "SELECT 1 FROM x_deliveries WHERE guild_id = ? AND post_id = ?",
-                (guild_id, post_id),
-            ).fetchone() is not None
+            return (
+                self._require_connection()
+                .execute(
+                    "SELECT 1 FROM x_deliveries WHERE guild_id = ? AND post_id = ?",
+                    (guild_id, post_id),
+                )
+                .fetchone()
+                is not None
+            )
 
     async def mark_x_post_delivered(self, guild_id: int, post_id: str) -> None:
         async with self.lock:
             connection = self._require_connection()
             with connection:
                 connection.execute(
-                    "INSERT OR IGNORE INTO x_deliveries VALUES (?, ?)", (guild_id, post_id)
+                    "INSERT OR IGNORE INTO x_deliveries VALUES (?, ?)",
+                    (guild_id, post_id),
                 )
 
     async def get_x_checkpoint(self, user_id: str) -> str | None:
         async with self.lock:
-            row = self._require_connection().execute(
-                "SELECT post_id FROM x_checkpoints WHERE user_id = ?", (user_id,)
-            ).fetchone()
+            row = (
+                self._require_connection()
+                .execute(
+                    "SELECT post_id FROM x_checkpoints WHERE user_id = ?", (user_id,)
+                )
+                .fetchone()
+            )
             return row["post_id"] if row else None
 
     async def set_x_checkpoint(self, user_id: str, post_id: str) -> None:
         async with self.lock:
             connection = self._require_connection()
             with connection:
-                connection.execute("INSERT OR REPLACE INTO x_checkpoints VALUES (?, ?)", (user_id, post_id))
+                connection.execute(
+                    "INSERT OR REPLACE INTO x_checkpoints VALUES (?, ?)",
+                    (user_id, post_id),
+                )

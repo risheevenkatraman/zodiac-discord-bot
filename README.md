@@ -16,6 +16,17 @@ and private channels without manually editing permission overwrites.
 
 ### Server configuration
 
+- `/scrim` - Open a private administrator-only scrim composer. Use **Edit details**
+  to enter a date (`YYYY-MM-DD`), local time (`HH:MM`, 24-hour), your timezone
+  (for example `America/New_York` or `Europe/London`), and a multiline message
+  (up to 1,700 characters, with Discord formatting). Discord does not expose your
+  timezone to bots, so you must supply it. Named timezones account for daylight
+  saving on the chosen date; ambiguous clock-change times require an explicit
+  UTC offset such as `-04:00`. Select a text or announcement channel, review the
+  preview, and click **Post scrim**. The bot posts immediately; the date/time is
+  the scrim start, displayed in each reader's timezone. The bot needs View Channel
+  and Send Messages there. Mentions do not ping. You can edit or cancel before
+  posting; menus expire after five minutes.
 - `/welcome channel:#welcome` - Post the styled Zodiac welcome message and website
   button to a text channel. Optionally supply up to five social pairs:
   `platform_1:X link_1:https://x.com/your_handle` through `platform_5` / `link_5`.

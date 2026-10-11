@@ -1,4 +1,5 @@
 """Normalize the single configured X account and its incoming post links."""
+
 import re
 import time
 from urllib.parse import urlparse
@@ -15,22 +16,31 @@ class XMonitor:
 
     async def get(self, session, path: str, params=None):
         async with session.get(
-            f"https://api.x.com/2/{path}", params=params,
+            f"https://api.x.com/2/{path}",
+            params=params,
             headers={"Authorization": f"Bearer {self.bearer_token}"},
         ) as response:
             if response.status in {401, 402, 403, 429}:
                 delay = 3600 if response.status != 429 else 900
                 if response.status == 429:
                     try:
-                        delay = max(delay, float(response.headers.get("x-rate-limit-reset", "0")) - time.time())
+                        delay = max(
+                            delay,
+                            float(response.headers.get("x-rate-limit-reset", "0"))
+                            - time.time(),
+                        )
                     except ValueError:
                         pass
                 self.next_attempt = time.monotonic() + delay
-                raise RuntimeError(f"X API returned HTTP {response.status}; check bearer token, API access/credits, or rate limits. Retrying after {int(delay)} seconds.")
+                raise RuntimeError(
+                    f"X API returned HTTP {response.status}; check bearer token, API access/credits, or rate limits. Retrying after {int(delay)} seconds."
+                )
             response.raise_for_status()
             payload = await response.json()
             if not isinstance(payload, dict) or payload.get("errors"):
-                raise RuntimeError("X returned an incomplete response; retaining the previous checkpoint.")
+                raise RuntimeError(
+                    "X returned an incomplete response; retaining the previous checkpoint."
+                )
             return payload
 
     async def poll(self, session) -> None:
@@ -43,8 +53,11 @@ class XMonitor:
                 self.user_id = None
                 raise RuntimeError("X could not resolve the configured account.")
         checkpoint = await self.database.get_x_checkpoint(self.user_id)
-        params = {"max_results": "5" if checkpoint is None else "100",
-                  "exclude": "retweets,replies", "tweet.fields": "author_id,referenced_tweets"}
+        params = {
+            "max_results": "5" if checkpoint is None else "100",
+            "exclude": "retweets,replies",
+            "tweet.fields": "author_id,referenced_tweets",
+        }
         if checkpoint and checkpoint != "0":
             params["since_id"] = checkpoint
         posts = {}
@@ -60,7 +73,9 @@ class XMonitor:
                 break
             params["pagination_token"] = next_token
         else:
-            raise RuntimeError("X pagination exceeded its limit; retaining the checkpoint.")
+            raise RuntimeError(
+                "X pagination exceeded its limit; retaining the checkpoint."
+            )
         newest = max(posts, key=int) if posts else checkpoint or "0"
         if checkpoint is None:
             # Start with future posts rather than flooding Discord with history.
@@ -86,9 +101,14 @@ def account_username(value: str) -> str:
     if "://" in value:
         parsed = urlparse(value)
         if parsed.scheme != "https" or parsed.netloc.lower() not in {
-            "x.com", "www.x.com", "twitter.com", "www.twitter.com"
+            "x.com",
+            "www.x.com",
+            "twitter.com",
+            "www.twitter.com",
         }:
-            raise ValueError("X_ACCOUNT must be an https://x.com/account profile URL or @username.")
+            raise ValueError(
+                "X_ACCOUNT must be an https://x.com/account profile URL or @username."
+            )
         value = parsed.path.strip("/")
     value = value.removeprefix("@")
     if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", value):
@@ -99,7 +119,10 @@ def account_username(value: str) -> str:
 def post_identity(url: str) -> tuple[str, str]:
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.netloc.lower() not in {
-        "x.com", "www.x.com", "twitter.com", "www.twitter.com"
+        "x.com",
+        "www.x.com",
+        "twitter.com",
+        "www.twitter.com",
     }:
         raise ValueError("Expected an X post URL.")
     match = re.fullmatch(r"/([A-Za-z0-9_]{1,15})/status/([0-9]{1,20})/?", parsed.path)
