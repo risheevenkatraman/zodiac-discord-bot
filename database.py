@@ -94,6 +94,15 @@ class Database:
             )
             connection.commit()
 
+    async def remove_role(self, guild_id: int, kind: str, role_id: int) -> None:
+        async with self.lock:
+            connection = self._require_connection()
+            connection.execute(
+                "DELETE FROM roles WHERE guild_id = ? AND kind = ? AND role_id = ?",
+                (guild_id, kind, role_id),
+            )
+            connection.commit()
+
     async def get_role(self, guild_id: int, kind: str) -> int | None:
         async with self.lock:
             row = (

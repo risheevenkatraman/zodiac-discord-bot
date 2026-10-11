@@ -22,9 +22,10 @@ from dotenv import load_dotenv
 
 from database import Database
 from media import MediaError, extract_info, extraction_options
-from x_feed import XMonitor, account_username, post_identity
-from welcome_card import render_join_card
+from permissions import can_administer
 from scrim import ScrimView
+from welcome_card import render_join_card
+from x_feed import XMonitor, account_username, post_identity
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -680,8 +681,13 @@ class ZodiacBot(commands.Bot):
 def administrator_only() -> Any:
     def decorator(command: Any) -> Any:
         command = app_commands.guild_only()(command)
-        command = app_commands.default_permissions(administrator=True)(command)
-        return app_commands.checks.has_permissions(administrator=True)(command)
+
+        async def check(interaction):
+            if not await can_administer(interaction):
+                raise app_commands.MissingPermissions(["administrator"])
+            return True
+
+        return app_commands.check(check)(command)
 
     return decorator
 
@@ -883,9 +889,10 @@ class SetupView(discord.ui.View):
         await interaction.response.edit_message(content="Setup cancelled.", view=None)
 
     async def begin_operation(self, interaction: discord.Interaction) -> bool:
-        if not interaction.permissions.administrator:
+        if not await can_administer(interaction):
             await send_error(
-                interaction, "You need Administrator permission to submit this setup."
+                interaction,
+                "You need Administrator permission or the configured bot admin role to submit this setup.",
             )
             return False
         if self.is_finished():
@@ -1777,6 +1784,34 @@ def build_welcome_message(
 
 
 def register_commands(bot: ZodiacBot) -> None:
+    @bot.tree.command(
+        name="admin_role",
+        description="Set or remove the role allowed to use bot administrator commands.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(
+        role="Role to authorize", enabled="False removes this role's access"
+    )
+    async def admin_role(
+        interaction: discord.Interaction, role: discord.Role, enabled: bool = True
+    ) -> None:
+        if role.is_default() or role.managed:
+            await send_error(
+                interaction, "Choose a normal server role other than @everyone."
+            )
+            return
+        if enabled:
+            await bot.database.set_role(interaction.guild_id, "bot_admin", role.id)
+            message = f"Members of {role.mention} can now use bot administrator commands. This replaces the previously configured role."
+        else:
+            await bot.database.remove_role(interaction.guild_id, "bot_admin", role.id)
+            message = f"Removed bot administrator access for {role.mention}."
+        await interaction.response.send_message(
+            message, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        )
+
     @bot.tree.command(
         name="scrim",
         description="Compose and post a scrim with a timezone-aware start time.",

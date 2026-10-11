@@ -16,21 +16,22 @@ and private channels without manually editing permission overwrites.
 
 ### Server configuration
 
-- `/scrim` - Open a private administrator-only scrim composer. Use **Edit details**
-  to enter a date (`YYYY-MM-DD`), local time (`HH:MM`, 24-hour), your timezone
-  (for example `America/New_York` or `Europe/London`), and a multiline message
-  (up to 1,700 characters, with Discord formatting). Discord does not expose your
-  timezone to bots, so you must supply it. Named timezones account for daylight
-  saving on the chosen date; ambiguous clock-change times require an explicit
-  UTC offset such as `-04:00`. Select a text or announcement channel, review the
-  preview, and click **Post scrim**. The bot posts immediately; the date/time is
-  the scrim start, displayed in each reader's timezone. The bot needs View Channel
-  and Send Messages there. Mentions do not ping. You can edit or cancel before
-  posting; menus expire after five minutes.
+- `/admin_role role:@Staff` - Allow one role to use all bot administrator commands.
+  Only Discord administrators can change this setting. Setting another role replaces
+  the previous one; `/admin_role role:@Staff enabled:False` revokes it. The setting
+  survives restarts and does not grant Discord's Administrator permission.
+- `/scrim` - Open a private scrim composer. Use **Choose date** for a calendar with
+  month navigation and selectable days, select your timezone from the dropdown,
+  and use **Edit details** for local time (`HH:MM`, 24-hour) and a formatted message.
+  US timezones and common worldwide zones are included and account for daylight
+  saving. For repeated clock-change times, select UTC and enter the UTC date/time.
+  Select a channel, review the preview, then **Post scrim** to publish immediately.
+  Readers see the start time in their own timezone. Mentions do not ping; menus
+  expire after five minutes. The bot needs View Channel and Send Messages.
 - `/welcome channel:#welcome` - Post the styled Zodiac welcome message and website
   button to a text channel. Optionally supply up to five social pairs:
   `platform_1:X link_1:https://x.com/your_handle` through `platform_5` / `link_5`.
-  Each pair needs both a name and an HTTP(S) link. Only administrators can run it;
+  Each pair needs both a name and an HTTP(S) link. Administrators and the configured bot admin role can run it;
   the bot needs View Channel, Send Messages, and Embed Links at the destination.
   Each invocation posts a new message without pinging anyone.
 - `/setup` - Configure the X/social notification channel, Twitch notification
@@ -74,7 +75,10 @@ holds up to 200 upcoming tracks; playlists that exceed the available space are
 rejected without adding a partial playlist. Skipping also works while paused.
 
 All moderation and server-configuration commands require the Discord Administrator
-permission. Music commands are available to server members.
+permission or the configured bot admin role (except `/admin_role`, which requires
+Administrator). After updating, restart the bot to sync commands. Existing custom
+command restrictions in Server Settings ? Integrations may need adjustment to
+allow the configured role. Music commands are available to server members.
 
 ## Features
 

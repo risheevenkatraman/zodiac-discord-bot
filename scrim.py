@@ -1,5 +1,6 @@
 """Private scrim composer and timezone conversion."""
 
+import calendar
 import logging
 import re
 from contextlib import suppress
@@ -7,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
+
+from permissions import can_administer
 
 
 def scrim_timestamp(date: str, time: str, zone: str) -> int:
@@ -50,7 +53,7 @@ def scrim_timestamp(date: str, time: str, zone: str) -> int:
         )
     if len(candidates) > 1:
         raise ValueError(
-            "That time occurs twice when clocks move back. Enter the intended UTC offset (for example -04:00 or -05:00) as your timezone."
+            "That time occurs twice when clocks move back. Choose UTC in the timezone dropdown and enter the corresponding UTC date and time."
         )
     return candidates.pop()
 
@@ -71,17 +74,8 @@ class ScrimModal(discord.ui.Modal, title="Scrim details"):
         super().__init__(timeout=300)
         self.composer = composer
         values = composer.values
-        self.date = discord.ui.TextInput(
-            label="Date (YYYY-MM-DD)", default=values[0], max_length=10
-        )
         self.time = discord.ui.TextInput(
             label="Your local time (HH:MM, 24-hour)", default=values[1], max_length=5
-        )
-        self.zone = discord.ui.TextInput(
-            label="Your timezone (Discord cannot detect it)",
-            placeholder="America/New_York, Europe/London, or +05:30",
-            default=values[2],
-            max_length=100,
         )
         self.details = discord.ui.TextInput(
             label="Scrim message (Discord formatting supported)",
@@ -89,33 +83,20 @@ class ScrimModal(discord.ui.Modal, title="Scrim details"):
             default=values[3],
             max_length=1700,
         )
-        for field in (self.date, self.time, self.zone, self.details):
+        for field in (self.time, self.details):
             self.add_item(field)
 
     async def on_submit(self, interaction):
         view = self.composer
         if not await view.interaction_check(interaction):
             return
-        view.values = tuple(
-            str(field) for field in (self.date, self.time, self.zone, self.details)
+        view.values = (
+            view.values[0],
+            str(self.time),
+            view.values[2],
+            str(self.details),
         )
-        try:
-            timestamp = scrim_timestamp(*view.values[:3])
-            content = announcement(timestamp, view.values[3])
-        except ValueError as error:
-            view.content = None
-            view.post.disabled = True
-            await interaction.response.edit_message(
-                content=f"{error} Use Edit details to correct your draft.", view=view
-            )
-            return
-        view.content = content
-        view.post.disabled = view.channel_id is None
-        await interaction.response.edit_message(
-            content=view.preview(),
-            view=view,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await view.refresh(interaction)
 
 
 class ScrimView(discord.ui.View):
@@ -128,21 +109,23 @@ class ScrimView(discord.ui.View):
         self.channel_id = None
         self.message = None
         self.submitted = False
+        self.month = datetime.now(timezone.utc).date().replace(day=1)
+        self.main_items = list(self.children)
 
     def preview(self):
         destination = (
             f"<#{self.channel_id}>" if self.channel_id else "Select a channel below"
         )
-        return f"**Scrim preview** · {destination}\nPost publishes immediately. Times display in each reader's timezone.\n\n{self.content or 'Choose Edit details to enter the date, local time, timezone, and message.'}"
+        return f"Date: {self.values[0] or 'Choose a date'} | Timezone: {self.values[2] or 'Choose a timezone'}\n**Scrim preview** · {destination}\nPost publishes immediately. Times display in each reader's timezone.\n\n{self.content or 'Choose a date and timezone, then Edit details to enter the local time and message.'}"
 
     async def interaction_check(self, interaction):
         if (
             interaction.user.id != self.owner_id
             or interaction.guild_id != self.guild_id
-            or not interaction.permissions.administrator
+            or not await can_administer(interaction)
         ):
             await interaction.response.send_message(
-                "Only the administrator who opened this menu can use it.",
+                "Only the authorized member who opened this menu can use it.",
                 ephemeral=True,
             )
             return False
@@ -152,6 +135,130 @@ class ScrimView(discord.ui.View):
             )
             return False
         return True
+
+    async def refresh(self, interaction):
+        self.content = None
+        error = None
+        if all(self.values):
+            try:
+                self.content = announcement(
+                    scrim_timestamp(*self.values[:3]), self.values[3]
+                )
+            except ValueError as exc:
+                error = str(exc)
+        self.post.disabled = self.content is None or self.channel_id is None
+        await interaction.response.edit_message(
+            content=self.preview() + (f"\n\n{error}" if error else ""),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.select(
+        placeholder="Choose your timezone",
+        row=2,
+        options=[
+            discord.SelectOption(label=label, value=zone)
+            for label, zone in [
+                ("US Eastern", "America/New_York"),
+                ("US Central", "America/Chicago"),
+                ("US Mountain", "America/Denver"),
+                ("US Pacific", "America/Los_Angeles"),
+                ("Alaska", "America/Anchorage"),
+                ("Hawaii", "Pacific/Honolulu"),
+                ("Arizona (no DST)", "America/Phoenix"),
+                ("Atlantic / Halifax", "America/Halifax"),
+                ("Brazil / S?o Paulo", "America/Sao_Paulo"),
+                ("UTC", "UTC"),
+                ("UK / London", "Europe/London"),
+                ("Central Europe / Berlin", "Europe/Berlin"),
+                ("Eastern Europe / Athens", "Europe/Athens"),
+                ("South Africa", "Africa/Johannesburg"),
+                ("Dubai", "Asia/Dubai"),
+                ("India", "Asia/Kolkata"),
+                ("Singapore / China", "Asia/Singapore"),
+                ("Japan / Korea", "Asia/Tokyo"),
+                ("Australia / Perth", "Australia/Perth"),
+                ("Australia / Sydney", "Australia/Sydney"),
+                ("New Zealand", "Pacific/Auckland"),
+            ]
+        ],
+    )
+    async def zone(self, interaction, select):
+        self.values = (self.values[0], self.values[1], select.values[0], self.values[3])
+        for option in select.options:
+            option.default = option.value == select.values[0]
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Choose date", row=1)
+    async def date(self, interaction, button):
+        if self.values[0]:
+            self.month = (
+                datetime.strptime(self.values[0], "%Y-%m-%d").date().replace(day=1)
+            )
+        elif self.values[2]:
+            self.month = datetime.now(ZoneInfo(self.values[2])).date().replace(day=1)
+        await self.show_calendar(interaction)
+
+    async def show_calendar(self, interaction):
+        self.clear_items()
+        days = calendar.monthrange(self.month.year, self.month.month)[1]
+        for row, start in enumerate((1, 17)):
+            select = discord.ui.Select(
+                placeholder=f"Choose day ({start}?{min(start + 15, days)})",
+                row=row,
+                options=[
+                    discord.SelectOption(
+                        label=self.month.replace(day=day).strftime("%a, %B %d"),
+                        value=self.month.replace(day=day).isoformat(),
+                        default=self.values[0]
+                        == self.month.replace(day=day).isoformat(),
+                    )
+                    for day in range(start, min(start + 16, days + 1))
+                ],
+            )
+
+            async def choose(request, control=select):
+                self.values = (
+                    control.values[0],
+                    self.values[1],
+                    self.values[2],
+                    self.values[3],
+                )
+                self.restore_menu()
+                await self.refresh(request)
+
+            select.callback = choose
+            self.add_item(select)
+        for label, delta in (("Previous month", -1), ("Next month", 1), ("Back", 0)):
+            button = discord.ui.Button(
+                label=label,
+                row=2,
+                disabled=(
+                    delta == -1 and self.month.year == 1 and self.month.month == 1
+                )
+                or (delta == 1 and self.month.year == 9999 and self.month.month == 12),
+            )
+
+            async def navigate(request, change=delta):
+                if change == 0:
+                    self.restore_menu()
+                    await self.refresh(request)
+                    return
+                index = self.month.year * 12 + self.month.month - 1 + change
+                self.month = self.month.replace(year=index // 12, month=index % 12 + 1)
+                await self.show_calendar(request)
+
+            button.callback = navigate
+            self.add_item(button)
+        await interaction.response.edit_message(
+            content=f"**Choose a scrim date ? {self.month:%B %Y}**\n```\n{calendar.month(self.month.year, self.month.month)}```",
+            view=self,
+        )
+
+    def restore_menu(self):
+        self.clear_items()
+        for item in self.main_items:
+            self.add_item(item)
 
     @discord.ui.button(label="Edit details", style=discord.ButtonStyle.primary, row=1)
     async def edit(self, interaction, button):

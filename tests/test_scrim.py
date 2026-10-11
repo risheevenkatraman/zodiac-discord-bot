@@ -75,10 +75,10 @@ class ScrimTests(unittest.IsolatedAsyncioTestCase):
             register_commands(bot)
             command = bot.tree.get_command("scrim")
             self.assertTrue(command.guild_only)
-            self.assertTrue(command.default_permissions.administrator)
+            self.assertIsNone(command.default_permissions)
             for check in command.checks:
                 with self.assertRaises(app_commands.MissingPermissions):
-                    check(SimpleNamespace(permissions=discord.Permissions.none()))
+                    await check(SimpleNamespace(permissions=discord.Permissions.none()))
         finally:
             await bot.close()
 
@@ -115,10 +115,11 @@ class ScrimTests(unittest.IsolatedAsyncioTestCase):
     async def test_modal_and_timeout(self):
         view = ScrimView(1, 2)
         view.channel_id = 3
+        view.values = ("2026-12-10", None, "America/New_York", None)
         modal = ScrimModal(view)
         for field, value in zip(
-            (modal.date, modal.time, modal.zone, modal.details),
-            ("2026-12-10", "18:00", "America/New_York", "**Practice**\nDetails"),
+            (modal.time, modal.details),
+            ("18:00", "**Practice**\nDetails"),
         ):
             field._value = value
         request = self.request()
@@ -131,3 +132,43 @@ class ScrimTests(unittest.IsolatedAsyncioTestCase):
         view.message.edit.assert_awaited_once()
         view.stop()
         modal.stop()
+
+
+class SelectorTests(unittest.IsolatedAsyncioTestCase):
+    request = ScrimTests.request
+
+    async def test_calendar_leap_year_and_navigation(self):
+        view = ScrimView(1, 2)
+        view.month = datetime(2028, 2, 1).date()
+        request = self.request()
+        await view.show_calendar(request)
+        selects = [
+            item for item in view.children if isinstance(item, discord.ui.Select)
+        ]
+        self.assertEqual(sum(len(item.options) for item in selects), 29)
+        selects[1]._values = ["2028-02-29"]
+        await selects[1].callback(request)
+        self.assertEqual(view.values[0], "2028-02-29")
+        self.assertIn(view.post, view.children)
+        view.month = datetime(2026, 12, 1).date()
+        await view.show_calendar(request)
+        await next(
+            item
+            for item in view.children
+            if getattr(item, "label", None) == "Next month"
+        ).callback(request)
+        self.assertEqual(view.month.isoformat(), "2027-01-01")
+        view.stop()
+
+    async def test_timezone_change_invalidates_preview(self):
+        view = ScrimView(1, 2)
+        view.channel_id = 3
+        view.values = ("2026-03-08", "02:30", "UTC", "Practice")
+        request = self.request()
+        await view.refresh(request)
+        self.assertFalse(view.post.disabled)
+        view.zone._values = ["America/New_York"]
+        await view.zone.callback(request)
+        self.assertIsNone(view.content)
+        self.assertTrue(view.post.disabled)
+        view.stop()

@@ -48,13 +48,13 @@ class WelcomeTests(unittest.IsolatedAsyncioTestCase):
                 build_welcome_message([pair])
 
     async def test_administrator_check(self):
-        self.assertTrue(self.command.default_permissions.administrator)
+        self.assertIsNone(self.command.default_permissions)
         self.assertTrue(self.command.guild_only)
         for check in self.command.checks:
             with self.assertRaises(app_commands.MissingPermissions):
-                check(SimpleNamespace(permissions=discord.Permissions.none()))
+                await check(SimpleNamespace(permissions=discord.Permissions.none()))
             self.assertTrue(
-                check(
+                await check(
                     SimpleNamespace(permissions=discord.Permissions(administrator=True))
                 )
             )
