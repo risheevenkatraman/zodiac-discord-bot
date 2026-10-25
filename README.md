@@ -26,8 +26,11 @@ and private channels without manually editing permission overwrites.
   US timezones and common worldwide zones are included and account for daylight
   saving. For repeated clock-change times, select UTC and enter the UTC date/time.
   Select a channel, review the preview, then **Post scrim** to publish immediately.
-  Readers see the start time in their own timezone. Mentions do not ping; menus
-  expire after five minutes. The bot needs View Channel and Send Messages.
+  Optionally select a role in **Select a role to ping**; clear the selection to
+  remove it. The posted message includes and pings that role. Other mentions and
+  previews do not ping. The role must be mentionable or the bot needs Mention
+  Everyone in the destination channel. Readers see the start time in their own
+  timezone. Menus expire after five minutes. The bot needs View Channel and Send Messages.
 - `/welcome channel:#welcome` - Post the styled Zodiac welcome message and website
   button to a text channel. Optionally supply up to five social pairs:
   `platform_1:X link_1:https://x.com/your_handle` through `platform_5` / `link_5`.
@@ -111,7 +114,8 @@ Setup dialogs include a Cancel button and expire after five minutes. Submitted
 dialogs cannot create duplicate roles or channels through repeated clicks.
 Errors remain visible privately, and successful changes receive public
 confirmations. Ordinary command output does not ping roles or users; social
-notifications mention only the role configured with `/setup`.
+notifications mention only the role configured with `/setup`, and scrim posts
+ping only the role selected in the composer.
 
 ## Running and testing
 

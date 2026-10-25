@@ -58,10 +58,12 @@ def scrim_timestamp(date: str, time: str, zone: str) -> int:
     return candidates.pop()
 
 
-def announcement(timestamp: int, details: str) -> str:
+def announcement(timestamp: int, details: str, role_id: int | None = None) -> str:
     if not details.strip():
         raise ValueError("Enter a message describing the scrim.")
     content = f"**Scrim — <t:{timestamp}:F> (<t:{timestamp}:R>)**\n\n{details}"
+    if role_id is not None:
+        content = f"<@&{role_id}>\n\n{content}"
     if len(content) > 2000:
         raise ValueError(
             "The message plus scrim timestamp must fit within Discord's 2,000-character limit."
@@ -107,6 +109,7 @@ class ScrimView(discord.ui.View):
         self.values = (None, None, None, None)
         self.content = None
         self.channel_id = None
+        self.role_id = None
         self.message = None
         self.submitted = False
         self.month = datetime.now(timezone.utc).date().replace(day=1)
@@ -142,7 +145,7 @@ class ScrimView(discord.ui.View):
         if all(self.values):
             try:
                 self.content = announcement(
-                    scrim_timestamp(*self.values[:3]), self.values[3]
+                    scrim_timestamp(*self.values[:3]), self.values[3], self.role_id
                 )
             except ValueError as exc:
                 error = str(exc)
@@ -279,6 +282,18 @@ class ScrimView(discord.ui.View):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="Select a role to ping (optional)",
+        min_values=0,
+        max_values=1,
+        row=3,
+    )
+    async def ping_role(self, interaction, select):
+        self.role_id = select.values[0].id if select.values else None
+        select.default_values = [discord.Object(id=self.role_id)] if self.role_id else []
+        await self.refresh(interaction)
+
     @discord.ui.button(
         label="Post scrim", style=discord.ButtonStyle.success, disabled=True, row=1
     )
@@ -303,6 +318,14 @@ class ScrimView(discord.ui.View):
                 "Enter the scrim details first.", ephemeral=True
             )
             return
+        if self.role_id is not None:
+            role = interaction.guild.get_role(self.role_id)
+            if role is None or (not role.mentionable and not permissions.mention_everyone):
+                await interaction.response.send_message(
+                    "Choose an existing mentionable role, or grant me Mention Everyone in that channel to ping the selected role.",
+                    ephemeral=True,
+                )
+                return
         self.submitted = (
             True  # Claim before the first await to prevent duplicate posts.
         )
@@ -310,7 +333,13 @@ class ScrimView(discord.ui.View):
         await interaction.response.defer()
         try:
             message = await channel.send(
-                self.content, allowed_mentions=discord.AllowedMentions.none()
+                self.content,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=False,
+                    roles=[discord.Object(id=self.role_id)] if self.role_id else False,
+                    replied_user=False,
+                ),
             )
         except discord.HTTPException:
             await interaction.edit_original_response(

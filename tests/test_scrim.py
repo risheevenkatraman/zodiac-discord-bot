@@ -112,6 +112,45 @@ class ScrimTests(unittest.IsolatedAsyncioTestCase):
         await view.cancel.callback(request)
         self.assertFalse(await view.interaction_check(request))
 
+    async def test_role_selection_preview_clear_and_post(self):
+        view = ScrimView(1, 2)
+        view.channel_id = 3
+        view.values = ("2026-12-10", "18:00", "UTC", "Practice @everyone <@&99> <@42>")
+        request = self.request()
+        request.guild.get_role = Mock(return_value=SimpleNamespace(mentionable=True))
+        view.ping_role._values = [discord.Object(id=7)]
+        await view.ping_role.callback(request)
+        self.assertTrue(view.content.startswith("<@&7>\n\n"))
+        self.assertEqual(view.ping_role.default_values[0].id, 7)
+        self.assertFalse(request.response.edit_message.await_args.kwargs["allowed_mentions"].roles)
+        view.ping_role._values = []
+        await view.ping_role.callback(request)
+        self.assertIsNone(view.role_id)
+        self.assertNotIn("<@&7>", view.content)
+        view.ping_role._values = [discord.Object(id=7)]
+        await view.ping_role.callback(request)
+        await view.post.callback(request)
+        sent = request.guild.get_channel.return_value.send.await_args
+        self.assertTrue(sent.args[0].startswith("<@&7>\n\n"))
+        mentions = sent.kwargs["allowed_mentions"].to_dict()
+        self.assertEqual(mentions["roles"], [7])
+        self.assertEqual(mentions["parse"], [])
+
+    async def test_unpingable_role_keeps_composer_open(self):
+        view = ScrimView(1, 2)
+        view.channel_id = 3
+        view.role_id = 7
+        view.content = announcement(123, "Practice", 7)
+        request = self.request()
+        request.guild.get_role = Mock(return_value=SimpleNamespace(mentionable=False))
+        await view.post.callback(request)
+        channel = request.guild.get_channel.return_value
+        channel.send.assert_not_awaited()
+        self.assertFalse(view.is_finished())
+        channel.permissions_for.return_value.mention_everyone = True
+        await view.post.callback(request)
+        channel.send.assert_awaited_once()
+
     async def test_modal_and_timeout(self):
         view = ScrimView(1, 2)
         view.channel_id = 3
